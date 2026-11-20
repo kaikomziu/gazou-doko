@@ -1,5 +1,5 @@
 // 画像どこかな検索 ― 画面の動き
-const VERSION = "1.3.0";
+const VERSION = "1.4.0";
 const SUPA = "https://kifnzvktwbomxthzvvgy.supabase.co";
 // 公開用の anon key（かるわかGAMES の SDK と同じ。公開しても問題ないキー）
 const ANON = "eyJhbGciOiJIUzI1NiIsInR5cCI6IkpXVCJ9.eyJpc3MiOiJzdXBhYmFzZSIsInJlZiI6ImtpZm56dmt0d2JvbXh0aHp2dmd5Iiwicm9sZSI6ImFub24iLCJpYXQiOjE3Nzc4MzgxMzgsImV4cCI6MjA5MzQxNDEzOH0.M7nXP-u--6J_6rRpgz1cJj21_7KX6MtfTmZy77Xf_IE";
@@ -41,6 +41,14 @@ async function rpc(fn, args = {}) {
 
 function reasonText(r) {
   const map = {
+    banned: "このアカウント・端末・ネットワークからの検索は止められています",
+    too_fast: "続けて検索しすぎです。1分ほど待ってからもう一度どうぞ",
+    multi_account: "同じ端末やネットワークで、たくさんのアカウントが使われています。いつものアカウントで検索してください",
+    origin: "このページ以外からは検索できません",
+    captcha: "ロボットでないことの確認が必要です",
+    captcha_fail: "ロボットでないことの確認に失敗しました。もう一度ためしてください",
+    captcha_load: "確認画面（CAPTCHA）を読み込めませんでした。広告ブロックなどを止めてもう一度ためしてください",
+    bad_request: "送ったデータが正しくありません",
     auth: "検索するには、かるわかGAMES アカウントでログインしてください",
     admin_only: "いまは管理者だけが使えます",
     limit: "今日の検索回数の上限に達しました。明日またどうぞ",
@@ -57,6 +65,77 @@ function reasonText(r) {
   if (/_(401|403)\b/.test(r)) return "API キーが正しくないか、権限がありません（" + r.slice(0, 60) + "）";
   if (/_429\b/.test(r) || /limit|quota|credits|searches/i.test(r)) return "API の回数上限に達しました（" + r.slice(0, 60) + "）";
   return "エラー：" + r.slice(0, 120);
+}
+
+// ---------- 不正対策：端末 ID とブラウザの特徴 ----------
+// 端末 ID はこのブラウザに保存した乱数。ブラウザの特徴は画面の大きさ・言語・時間帯などをまとめたハッシュ
+// （どちらも個人を特定するものではなく、同じ端末からの使いすぎ・アカウントの作りすぎを見つけるため）
+function deviceId() {
+  try {
+    let v = localStorage.getItem("imd_device");
+    if (!/^[0-9a-f]{32}$/.test(v || "")) {
+      v = [...crypto.getRandomValues(new Uint8Array(16))].map((b) => b.toString(16).padStart(2, "0")).join("");
+      localStorage.setItem("imd_device", v);
+    }
+    return v;
+  } catch { return ""; }
+}
+let FP = "";
+async function fingerprint() {
+  if (FP) return FP;
+  try {
+    const parts = [navigator.userAgent, navigator.language, (navigator.languages || []).join(","), navigator.platform,
+      screen.width + "x" + screen.height + "x" + screen.colorDepth, devicePixelRatio, Intl.DateTimeFormat().resolvedOptions().timeZone,
+      navigator.hardwareConcurrency, navigator.deviceMemory, navigator.maxTouchPoints];
+    const c = document.createElement("canvas"); c.width = 220; c.height = 30;
+    const g = c.getContext("2d");
+    g.textBaseline = "top"; g.font = "16px 'Arial'"; g.fillStyle = "#f60"; g.fillRect(100, 1, 60, 20);
+    g.fillStyle = "#069"; g.fillText("画像どこかな🔎 fp", 2, 4);
+    parts.push(c.toDataURL());
+    const h = await crypto.subtle.digest("SHA-256", new TextEncoder().encode(parts.join("|")));
+    FP = [...new Uint8Array(h)].slice(0, 16).map((b) => b.toString(16).padStart(2, "0")).join("");
+  } catch { FP = ""; }
+  return FP;
+}
+
+// ---------- CAPTCHA（hCaptcha ／ reCAPTCHA。見えないタイプで、あやしいときだけ問題が出る） ----------
+let capWidget = null, capLoaded = null, capResolve = null;
+function loadScript(src) {
+  return new Promise((ok, ng) => { const sc = document.createElement("script"); sc.src = src; sc.async = true; sc.onload = ok; sc.onerror = ng; document.head.appendChild(sc); });
+}
+async function captchaToken(ci) {
+  if (!ci || ci.provider === "off" || !ci.sitekey) return "";
+  const box = document.getElementById("captchaBox") || Object.assign(document.body.appendChild(document.createElement("div")), { id: "captchaBox" });
+  try {
+    if (ci.provider === "hcaptcha") {
+      capLoaded = capLoaded || loadScript("https://js.hcaptcha.com/1/api.js?render=explicit&recaptchacompat=off&hl=ja");
+      await capLoaded;
+      for (let i = 0; i < 50 && !window.hcaptcha?.render; i++) await sleep(100);
+      if (capWidget === null) capWidget = hcaptcha.render(box, { sitekey: ci.sitekey, size: "invisible" });
+      else hcaptcha.reset(capWidget);
+      const r = await hcaptcha.execute(capWidget, { async: true });
+      return r?.response || "";
+    }
+    if (ci.provider === "recaptcha3") {
+      capLoaded = capLoaded || loadScript("https://www.google.com/recaptcha/api.js?render=" + encodeURIComponent(ci.sitekey) + "&hl=ja");
+      await capLoaded;
+      await new Promise((ok) => grecaptcha.ready(ok));
+      return await grecaptcha.execute(ci.sitekey, { action: "search" });
+    }
+    // reCAPTCHA v2（見えないタイプ）
+    capLoaded = capLoaded || loadScript("https://www.google.com/recaptcha/api.js?render=explicit&hl=ja");
+    await capLoaded;
+    for (let i = 0; i < 50 && !window.grecaptcha?.render; i++) await sleep(100);
+    return await new Promise((ok, ng) => {
+      capResolve = ok;
+      if (capWidget === null) capWidget = grecaptcha.render(box, { sitekey: ci.sitekey, size: "invisible", callback: (t) => capResolve && capResolve(t), "error-callback": () => ng(new Error("captcha")) });
+      else grecaptcha.reset(capWidget);
+      grecaptcha.execute(capWidget);
+    });
+  } catch (e) {
+    // 問題を閉じた・読み込めなかった
+    return null;
+  }
 }
 
 // ---------- エンジン・サイトの見た目 ----------
@@ -468,7 +547,24 @@ async function search() {
   const btn = $("#searchBtn");
   const label = btn.innerHTML;
   btn.innerHTML = "画像を送っています…";
-  const up = await api("upload", picked.kind === "file" ? { image: picked.dataUrl } : { url: picked.url });
+  const payload = picked.kind === "file" ? { image: picked.dataUrl } : { url: picked.url };
+  payload.device = deviceId();
+  payload.fp = await fingerprint();
+  let up;
+  // CAPTCHA が要るとわかっているときは先に、サーバーに求められたときはその場で1回だけ
+  let ci = INFO?.captcha?.need ? INFO.captcha : null;
+  for (let tries = 0; tries < 2; tries++) {
+    if (ci) {
+      btn.innerHTML = "ロボットでないか確認しています…";
+      const t = await captchaToken(ci);
+      if (t === null || !t) { up = { ok: false, reason: t === null ? "captcha_load" : "captcha" }; break; }
+      payload.captcha = t;
+    }
+    btn.innerHTML = "画像を送っています…";
+    up = await api("upload", payload);
+    if (up.ok || !(up.reason === "captcha" || up.reason === "captcha_fail") || !up.captcha) break;
+    ci = up.captcha;
+  }
   btn.innerHTML = label;
   if (!up.ok) {
     running = false; updateSearchBtn();
@@ -739,6 +835,25 @@ async function renderAdmin() {
       <p class="fine" style="margin:-6px 0 0">選べるようにすると、検索画面に「隠す／ぼかす／表示する」が出ます（はじめて選ぶときに18歳以上かを確認）。成人向けの判定ができるのは SauceNAO・trace.moe・IQDB・Fluffle・pixiv の作品だけです。</p>
       <label>お知らせ（検索画面の上に出ます）<span class="row"><textarea class="grow" rows="2" data-k="notice" placeholder="なし">${esc(st.notice || "")}</textarea><button class="btn sm" data-save="notice">保存</button></span></label>
     </div></div>
+    <div class="panel"><h2>不正対策の設定</h2>
+      <p class="fine">IP・ネットワーク・端末 ID・ブラウザの特徴・アカウントを照合して、使いすぎ・アカウントの作りすぎ・連続アクセスを止めます。IP はそのまま保存せず、ハッシュ（暗号のような文字列）で照合します。</p>
+      <div class="kv">
+        ${sel("captcha_provider", "CAPTCHA（ロボット確認）", [["off", "使わない"], ["hcaptcha", "hCaptcha（おすすめ）"], ["recaptcha2", "reCAPTCHA v2（見えないタイプ）"], ["recaptcha3", "reCAPTCHA v3（スコア）"]], "off")}
+        ${sel("captcha_mode", "CAPTCHA を出す相手", [["risky", "あやしいときだけ（ゲスト・できたばかりのアカウント・最近止められた人）"], ["guest", "ゲストだけ"], ["all", "全員（毎回）"]], "risky")}
+        <p class="fine" style="margin:-6px 0 0">hCaptcha ${st.hcaptcha_sitekey ? '<span class="set">サイトキー設定済み</span>' : '<span class="unset">サイトキー未設定</span>'} ${sec.hcaptcha_secret ? '<span class="set">シークレット設定済み</span>' : '<span class="unset">シークレット未設定</span>'} ／ reCAPTCHA ${st.recaptcha_sitekey ? '<span class="set">サイトキー設定済み</span>' : '<span class="unset">サイトキー未設定</span>'} ${sec.recaptcha_secret ? '<span class="set">シークレット設定済み</span>' : '<span class="unset">シークレット未設定</span>'}<br>CAPTCHA の管理画面で、ドメインに kaikomziu.github.io を登録しておいてください。</p>
+        ${textInput("hcaptcha_sitekey", "hCaptcha のサイトキー", "")}
+        ${secretInput("hcaptcha_secret", "hCaptcha のシークレット").replace("API キー", "hCaptcha のシークレット")}
+        ${textInput("recaptcha_sitekey", "reCAPTCHA のサイトキー", "")}
+        ${secretInput("recaptcha_secret", "reCAPTCHA のシークレット").replace("API キー", "reCAPTCHA のシークレット")}
+        ${textInput("recaptcha_min_score", "reCAPTCHA v3 の合格スコア（0〜1）", "0.5")}
+        ${textInput("burst_per_min", "1分に検索できる回数", "4", "超えると待ってもらいます。10分で5倍を超えると、その IP と端末を1時間自動ブロック")}
+        ${textInput("ip_daily_limit", "1つの IP の1日の合計", "60", "アカウントを作り直しても増えません。0 で無制限（学校や家族で同じ IP のことがあるので多め）")}
+        ${textInput("device_daily_limit", "1つの端末の1日の合計", "40", "0 で無制限")}
+        ${textInput("multi_account_limit", "同じ端末で使えるアカウントの数（24時間）", "3", "これを超えた別のアカウントは検索できません。同じ IP では2倍まで")}
+        ${textInput("new_account_limit", "できたばかり（24時間以内）のアカウントの1日の回数", "5")}
+        ${textInput("allowed_origins", "検索を受け付けるページ（カンマ区切り）", "https://kaikomziu.github.io,http://localhost:8820", "ほかのサイトから API を勝手に使われるのを防ぎます")}
+      </div></div>
+    <div class="panel"><h2>あやしい動き・ブロック</h2><div id="secBody"><p class="fine">読み込み中…</p></div></div>
     <div class="panel"><h2>この7日間のエンジン別</h2>
       ${stats.length ? `<table class="stats"><tr><th>日付</th><th>エンジン</th><th>API 呼び出し</th><th>使い回し</th><th>失敗</th></tr>${stats.map((s) => `<tr><td>${esc(s.day)}</td><td>${esc(ENGINE_LABEL[s.engine] || s.engine)}</td><td class="n">${s.calls}</td><td class="n">${s.cached}</td><td class="n">${s.errors}</td></tr>`).join("")}</table>` : `<p class="fine">まだ記録はありません。</p>`}
     </div>
@@ -764,6 +879,7 @@ async function renderAdmin() {
   $$("[data-autosave]", body).forEach((s) => s.onchange = async () => { if (await save(s.dataset.k, s.value)) loadInfo(); });
   $$("[data-engine-on]", body).forEach((c) => c.onchange = async () => { if (await save("engine_" + c.dataset.engineOn, c.checked ? "on" : "off")) loadInfo(); });
   $("#clearCache").onclick = async () => { if (confirm("保存済みの結果をすべて消しますか？")) { await save("clear_cache", "1"); renderAdmin(); } };
+  renderSecurity();
   $$("[data-test]", body).forEach((b) => b.onclick = async () => {
     const e = b.dataset.test, out = $(`[data-out="${e}"]`, body);
     out.classList.remove("hide"); out.textContent = "テスト中…（見本の画像で検索しています）";
@@ -776,9 +892,68 @@ async function renderAdmin() {
   });
 }
 
+// ---------- admin：あやしい動き・ブロック ----------
+const KIND_LABEL = { account: "アカウント", ip: "IP", net: "ネットワーク", device: "端末", fp: "ブラウザの特徴" };
+const RESULT_LABEL = { ok: "検索", blocked: "止めた" };
+const REASON_LABEL = {
+  too_fast: "連続アクセス", multi_account: "複数アカウント", ip_limit: "IP の回数切れ", device_limit: "端末の回数切れ", limit: "回数切れ",
+  "ban:account": "ブロック中（アカウント）", "ban:ip": "ブロック中（IP）", "ban:net": "ブロック中（ネットワーク）", "ban:device": "ブロック中（端末）", "ban:fp": "ブロック中（ブラウザ）",
+};
+const short = (v) => (v ? String(v).slice(0, 8) : "—");
+const reasonLabel = (r) => !r ? "" : REASON_LABEL[r] || (r.startsWith("captcha_fail") ? "CAPTCHA 失敗" : r.startsWith("origin") ? "ほかのサイトから" : r);
+async function renderSecurity() {
+  const box = $("#secBody");
+  if (!box) return;
+  const r = await rpc("imd_admin_security", { p_token: token() }).catch(() => null);
+  if (!r || !r.ok) { box.innerHTML = `<p class="fine">読み込めませんでした。</p>`; return; }
+  const banBtns = (kind, value, label) => value ? `<button class="btn ghost sm" data-ban="${kind}" data-v="${esc(value)}" title="${esc(KIND_LABEL[kind])}をブロック">${label || "止める"}</button>` : "";
+  box.innerHTML = `
+    <h3 style="margin:6px 0">ブロック中（${r.bans.length}）</h3>
+    ${r.bans.length ? `<table class="stats"><tr><th>種類</th><th>対象</th><th>理由</th><th>期限</th><th></th></tr>${r.bans.map((b) => `<tr>
+      <td>${esc(KIND_LABEL[b.kind])}</td><td>${esc(b.username || short(b.value))}</td><td>${esc(b.reason || "")}${b.created_by === "auto" ? "" : ` <span class="fine">（${esc(b.created_by || "")}）</span>`}</td>
+      <td>${b.until ? new Date(b.until).toLocaleString("ja-JP") : "ずっと"}</td><td><button class="btn ghost sm" data-unban="${b.id}">解除</button></td></tr>`).join("")}</table>` : `<p class="fine">ありません。</p>`}
+    <div class="row" style="margin:10px 0">
+      <select id="banKind">${Object.entries(KIND_LABEL).map(([k, l]) => `<option value="${k}">${l}</option>`).join("")}</select>
+      <input class="grow" id="banValue" type="text" placeholder="ユーザー名、または一覧の値">
+      <select id="banHours"><option value="1">1時間</option><option value="24" selected>1日</option><option value="168">1週間</option><option value="0">ずっと</option></select>
+      <input id="banReason" type="text" placeholder="理由（任意）" style="width:140px">
+      <button class="btn sm" id="banAdd">ブロック</button>
+    </div>
+    <h3 style="margin:14px 0 6px">あやしい IP（24時間）</h3>
+    <p class="fine" style="margin-top:0">止められた回数がある・複数のアカウントが使われている・10回以上検索した IP。</p>
+    ${r.suspects.length ? `<table class="stats"><tr><th>IP</th><th>検索</th><th>止めた</th><th>アカウント</th><th>端末</th><th>使った人</th><th></th></tr>${r.suspects.map((x) => `<tr>
+      <td title="${esc(x.ip)}">${short(x.ip)}</td><td class="n">${x.total}</td><td class="n">${x.blocked}</td><td class="n">${x.accounts}</td><td class="n">${x.devices}</td>
+      <td>${esc(x.usernames || "ゲスト")}</td><td>${banBtns("ip", x.ip, "IP を止める")} ${banBtns("net", x.net, "ネットワークごと")}</td></tr>`).join("")}</table>` : `<p class="fine">ありません。</p>`}
+    <h3 style="margin:14px 0 6px">最近の記録</h3>
+    <div style="overflow-x:auto"><table class="stats"><tr><th>時刻</th><th>結果</th><th>理由</th><th>アカウント</th><th>IP</th><th>端末</th><th></th></tr>${r.recent.map((x) => `<tr>
+      <td>${new Date(x.at).toLocaleString("ja-JP")}</td><td>${x.result === "ok" ? "検索" : '<span class="unset">止めた</span>'}</td><td>${esc(reasonLabel(x.reason))}</td>
+      <td>${esc(x.username || "ゲスト")}</td><td title="${esc(x.ip)}">${short(x.ip)}</td><td title="${esc(x.device || "")}">${short(x.device)}</td>
+      <td>${x.account ? banBtns("account", x.account, "人") : ""}${banBtns("ip", x.ip, "IP")}${banBtns("device", x.device, "端末")}</td></tr>`).join("")}</table></div>`;
+  const ban = async (kind, value, hours, reason) => {
+    const x = await rpc("imd_admin_ban", { p_token: token(), p_kind: kind, p_value: value, p_hours: hours, p_reason: reason }).catch(() => null);
+    if (x?.ok) { toast("ブロックしました"); renderSecurity(); }
+    else toast(x?.reason === "admin" ? "管理者はブロックできません" : x?.reason === "notfound" ? "そのユーザー名は見つかりません" : "ブロックできませんでした");
+  };
+  $$("[data-ban]", box).forEach((b) => b.onclick = () => {
+    const h = prompt(`${KIND_LABEL[b.dataset.ban]}「${short(b.dataset.v)}」を何時間ブロックしますか？（0 でずっと）`, "24");
+    if (h === null) return;
+    ban(b.dataset.ban, b.dataset.v, Math.max(0, parseInt(h, 10) || 0), "管理者が手動で");
+  });
+  $$("[data-unban]", box).forEach((b) => b.onclick = async () => {
+    const x = await rpc("imd_admin_unban", { p_token: token(), p_id: Number(b.dataset.unban) }).catch(() => null);
+    if (x?.ok) { toast("解除しました"); renderSecurity(); } else toast("解除できませんでした");
+  });
+  $("#banAdd").onclick = () => {
+    const v = $("#banValue").value.trim();
+    if (!v) return toast("ブロックする相手を入れてください");
+    ban($("#banKind").value, v, Number($("#banHours").value), $("#banReason").value.trim() || "管理者が手動で");
+  };
+}
+
 // ---------- 起動 ----------
 (async function start() {
   route();
+  deviceId(); fingerprint();
   if (window.KaAccount) {
     await Promise.race([KaAccount.ready, sleep(4000)]).catch(() => {});
     KaAccount.onChange(() => { renderAcct(); loadInfo(); });

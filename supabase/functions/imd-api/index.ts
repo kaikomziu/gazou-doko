@@ -17,7 +17,7 @@ const json = (o: unknown, status = 200) =>
 const clip = (s: unknown, n: number) => String(s ?? "").slice(0, n);
 
 type Config = { secrets: Record<string, string>; settings: Record<string, string> };
-type Acc = { id: string; username: string; display_name: string; is_admin: boolean } | null;
+type Acc = { id: string; username: string; display_name: string; is_admin: boolean; created_at?: string } | null;
 
 async function config(): Promise<Config> {
   const { data, error } = await sb.rpc("imd_internal_config");
@@ -33,9 +33,55 @@ async function sha256(buf: Uint8Array) {
   const h = await crypto.subtle.digest("SHA-256", buf);
   return [...new Uint8Array(h)].map((b) => b.toString(16).padStart(2, "0")).join("");
 }
+const clientIp = (req: Request) => (req.headers.get("x-forwarded-for") || "").split(",")[0].trim() || "unknown";
+const hashText = async (t: string) => (await sha256(new TextEncoder().encode("imd-salt|" + t))).slice(0, 24);
 async function ipHash(req: Request) {
-  const ip = (req.headers.get("x-forwarded-for") || "").split(",")[0].trim() || "unknown";
-  return "ip:" + (await sha256(new TextEncoder().encode("imd-salt|" + ip))).slice(0, 24);
+  return "ip:" + (await hashText(clientIp(req)));
+}
+
+// ---------- 不正対策 ----------
+// 照合に使うもの：IP（ハッシュ）、ネットワーク（IP の前半のハッシュ）、端末 ID（ブラウザに保存した乱数）、
+// ブラウザの特徴（画面の大きさ・言語・時間帯などのハッシュ）、アカウント。IP はそのまま保存しない
+type Ident = { ip: string; net: string; device: string; fp: string };
+async function ident(req: Request, body: Record<string, unknown>): Promise<Ident> {
+  const ip = clientIp(req);
+  const net = ip.includes(":") ? ip.split(":").slice(0, 4).join(":") : ip.split(".").slice(0, 3).join(".");
+  const device = typeof body.device === "string" && /^[0-9a-f]{32}$/.test(body.device) ? body.device : "";
+  const fp = typeof body.fp === "string" && /^[0-9a-f]{16,64}$/.test(body.fp) ? body.fp.slice(0, 32) : "";
+  return { ip: await hashText(ip), net: "n" + (await hashText("net|" + net)), device, fp };
+}
+const DEFAULT_ORIGINS = "https://kaikomziu.github.io,http://localhost:8820";
+function originOk(cfg: Config, req: Request) {
+  const o = req.headers.get("origin") || "";
+  const list = (cfg.settings.allowed_origins || DEFAULT_ORIGINS).split(",").map((x) => x.trim()).filter(Boolean);
+  return !!o && list.includes(o);
+}
+function captchaInfo(cfg: Config) {
+  const provider = cfg.settings.captcha_provider || "off";
+  const sitekey = provider === "hcaptcha" ? cfg.settings.hcaptcha_sitekey : provider.startsWith("recaptcha") ? cfg.settings.recaptcha_sitekey : "";
+  const secret = provider === "hcaptcha" ? cfg.secrets.hcaptcha_secret : provider.startsWith("recaptcha") ? cfg.secrets.recaptcha_secret : "";
+  if (provider === "off" || !sitekey || !secret) return { provider: "off", sitekey: "", mode: "off" };
+  return { provider, sitekey, mode: cfg.settings.captcha_mode || "risky" };
+}
+// CAPTCHA の答えをサーバーで確かめる（画面の判定は信用しない）
+async function verifyCaptcha(cfg: Config, token: unknown, req: Request): Promise<{ ok: boolean; err?: string }> {
+  const ci = captchaInfo(cfg);
+  if (ci.provider === "off") return { ok: true };
+  if (typeof token !== "string" || token.length < 20 || token.length > 5000) return { ok: false, err: "no_token" };
+  const fd = new URLSearchParams({ response: token, remoteip: clientIp(req) });
+  let url = "";
+  if (ci.provider === "hcaptcha") { url = "https://api.hcaptcha.com/siteverify"; fd.set("secret", cfg.secrets.hcaptcha_secret); fd.set("sitekey", ci.sitekey); }
+  else { url = "https://www.google.com/recaptcha/api/siteverify"; fd.set("secret", cfg.secrets.recaptcha_secret); }
+  try {
+    const d = await (await fetch(url, { method: "POST", body: fd })).json();
+    if (!d.success) return { ok: false, err: clip((d["error-codes"] || []).join(","), 80) || "fail" };
+    if (ci.provider === "recaptcha3") {
+      const min = Number(cfg.settings.recaptcha_min_score || 0.5);
+      if (Number(d.score) < min) return { ok: false, err: "score " + d.score };
+      if (d.action && d.action !== "search") return { ok: false, err: "action" };
+    }
+    return { ok: true };
+  } catch (_e) { return { ok: false, err: "verify_error" }; }
 }
 async function stat(engine: string, kind: "call" | "cached" | "error", info?: string) {
   try { await sb.rpc("imd_internal_stat", { p_engine: engine, p_kind: kind, p_info: info ?? null }); } catch (_e) { /* 無視 */ }
@@ -550,7 +596,9 @@ Deno.serve(async (req) => {
     const acc = await account(body.ka_token);
     const who = acc ? "acc:" + acc.id : await ipHash(req);
     const access = cfg.settings.access || "login";
-    const limit = acc?.is_admin ? 0 : acc ? Number(cfg.settings.daily_limit || 20) : Number(cfg.settings.guest_daily_limit || 3);
+    // できたばかり（24時間以内）のアカウントは回数を少なくする（使い捨てアカウント対策）
+    const isNew = !!acc && !acc.is_admin && !!acc.created_at && Date.now() - Date.parse(acc.created_at) < 86400e3;
+    const limit = acc?.is_admin ? 0 : isNew ? Number(cfg.settings.new_account_limit || 5) : acc ? Number(cfg.settings.daily_limit || 20) : Number(cfg.settings.guest_daily_limit || 3);
 
     // ---- 画面の初期情報 ----
     if (action === "info") {
@@ -562,6 +610,11 @@ Deno.serve(async (req) => {
         labels: { ris: cfg.settings.ris_label || "Reverse Image Search API" },
         modes: { serpapi: cfg.settings.serpapi_engine || "google_lens", searchapi: cfg.settings.searchapi_engine || "google_lens" },
         notice: cfg.settings.notice || "", adult_mode: adultMode(cfg),
+        captcha: (() => {
+          const ci = captchaInfo(cfg);
+          const need = ci.mode === "all" || (ci.mode === "guest" && !acc) || (ci.mode === "risky" && (!acc || isNew));
+          return { ...ci, need: ci.provider !== "off" && !acc?.is_admin && need };
+        })(),
       });
     }
 
@@ -577,6 +630,32 @@ Deno.serve(async (req) => {
     if (action === "upload") {
       if (access === "admin" && !acc?.is_admin) return json({ ok: false, reason: "admin_only" });
       if (access === "login" && !acc) return json({ ok: false, reason: "auth" });
+      // ---- 不正対策：このサイト以外からの呼び出し・CAPTCHA・ブロック・回数をまとめて照合 ----
+      const id = await ident(req, body);
+      const logBase = { account: acc?.id || "", ip: id.ip, net: id.net, device: id.device, fp: id.fp };
+      if (!acc?.is_admin && !originOk(cfg, req)) {
+        await sb.rpc("imd_internal_log", { p: { ...logBase, reason: "origin:" + clip(req.headers.get("origin") || "none", 80) } });
+        return json({ ok: false, reason: "origin" });
+      }
+      let captchaOk = false;
+      if (body.captcha) {
+        const v = await verifyCaptcha(cfg, body.captcha, req);
+        if (!v.ok) {
+          await sb.rpc("imd_internal_log", { p: { ...logBase, reason: "captcha_fail:" + v.err } });
+          return json({ ok: false, reason: "captcha_fail", captcha: captchaInfo(cfg) });
+        }
+        captchaOk = true;
+      }
+      const ci = captchaInfo(cfg);
+      const { data: gate, error: gerr } = await sb.rpc("imd_internal_gate", { p: {
+        ...logBase, is_admin: !!acc?.is_admin, is_new: isNew, who, limit,
+        burst: Number(cfg.settings.burst_per_min || 4), ip_daily: Number(cfg.settings.ip_daily_limit ?? 60),
+        device_daily: Number(cfg.settings.device_daily_limit ?? 40), multi: Number(cfg.settings.multi_account_limit || 3),
+        captcha_mode: ci.mode, captcha_ok: captchaOk,
+      } });
+      if (gerr) throw new Error("gate");
+      const g = gate as { ok: boolean; reason?: string; count?: number; until?: string };
+      if (!g.ok) return json({ ok: false, reason: g.reason, until: g.until, captcha: g.reason === "captcha" ? ci : undefined });
       let buf: Uint8Array;
       if (typeof body.image === "string" && body.image) {
         const b64 = body.image.replace(/^data:[^,]*,/, "");
@@ -588,8 +667,6 @@ Deno.serve(async (req) => {
       const mime = sniff(buf);
       if (!mime) return json({ ok: false, reason: "not_image" });
       if (buf.length > MAX) return json({ ok: false, reason: "too_big" });
-      const { data: use } = await sb.rpc("imd_internal_use", { p_who: who, p_limit: limit });
-      if (!(use as { ok: boolean })?.ok) return json({ ok: false, reason: "limit" });
       sweep();
       const sha = await sha256(buf);
       const path = `${crypto.randomUUID()}.${mime.split("/")[1]}`;
@@ -597,7 +674,7 @@ Deno.serve(async (req) => {
       if (up.error) throw new Error("storage");
       const { data: row, error } = await sb.from("imd_uploads").insert({ path, sha, who }).select("id").single();
       if (error) throw new Error("db");
-      return json({ ok: true, id: row.id, engines: ENGINES.filter((e) => enabled(cfg, e)), used: (use as { count: number }).count, limit });
+      return json({ ok: true, id: row.id, engines: ENGINES.filter((e) => enabled(cfg, e)), used: g.count || 0, limit });
     }
 
     // ---- 1つのエンジンで検索 ----

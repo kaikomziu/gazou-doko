@@ -1,0 +1,578 @@
+// 画像どこかな検索 ― 画面の動き
+const VERSION = "1.0.0";
+const SUPA = "https://kifnzvktwbomxthzvvgy.supabase.co";
+// 公開用の anon key（かるわかGAMES の SDK と同じ。公開しても問題ないキー）
+const ANON = "eyJhbGciOiJIUzI1NiIsInR5cCI6IkpXVCJ9.eyJpc3MiOiJzdXBhYmFzZSIsInJlZiI6ImtpZm56dmt0d2JvbXh0aHp2dmd5Iiwicm9sZSI6ImFub24iLCJpYXQiOjE3Nzc4MzgxMzgsImV4cCI6MjA5MzQxNDEzOH0.M7nXP-u--6J_6rRpgz1cJj21_7KX6MtfTmZy77Xf_IE";
+const FN = `${SUPA}/functions/v1/imd-api`;
+
+const $ = (s, el = document) => el.querySelector(s);
+const $$ = (s, el = document) => [...el.querySelectorAll(s)];
+const esc = (s) => String(s ?? "").replace(/[&<>"']/g, (c) => ({ "&": "&amp;", "<": "&lt;", ">": "&gt;", '"': "&quot;", "'": "&#39;" }[c]));
+const sleep = (ms) => new Promise((r) => setTimeout(r, ms));
+const token = () => (window.KaAccount && KaAccount.token()) || null;
+
+let toastTimer;
+function toast(msg, ms = 3200) {
+  const t = $("#toast");
+  t.textContent = msg; t.classList.add("on");
+  clearTimeout(toastTimer); toastTimer = setTimeout(() => t.classList.remove("on"), ms);
+}
+
+// ---------- サーバー ----------
+async function api(action, args = {}) {
+  try {
+    const res = await fetch(FN, {
+      method: "POST",
+      headers: { apikey: ANON, Authorization: "Bearer " + ANON, "Content-Type": "application/json" },
+      body: JSON.stringify({ action, ka_token: token(), ...args }),
+    });
+    return await res.json();
+  } catch (e) { return { ok: false, reason: "network" }; }
+}
+async function rpc(fn, args = {}) {
+  const res = await fetch(`${SUPA}/rest/v1/rpc/${fn}`, {
+    method: "POST",
+    headers: { apikey: ANON, Authorization: "Bearer " + ANON, "Content-Type": "application/json" },
+    body: JSON.stringify(args),
+  });
+  if (!res.ok) throw new Error("http " + res.status);
+  return res.json();
+}
+
+function reasonText(r) {
+  const map = {
+    auth: "検索するには、かるわかGAMES アカウントでログインしてください",
+    admin_only: "いまは管理者だけが使えます",
+    limit: "今日の検索回数の上限に達しました。明日またどうぞ",
+    too_big: "画像が大きすぎます（10MB まで）", not_image: "画像として読み込めませんでした（JPEG・PNG・WebP・GIF）",
+    empty: "画像を選んでください", bad_url: "その URL は使えません", expired: "時間がたちすぎました。もう一度検索してください",
+    used: "このエンジンでは検索済みです", disabled: "このエンジンは使えない設定です", network: "通信できませんでした",
+    forbidden: "権限がありません", no_key: "API キーが設定されていません", pixiv_noimage: "pixiv の画像を取れませんでした",
+    pixiv_404: "pixiv の作品が見つかりません（非公開・削除済み・R-18 は読み込めません）",
+  };
+  if (!r) return "通信できませんでした";
+  if (map[r]) return map[r];
+  if (/^fetch_/.test(r)) return "その URL から画像を取れませんでした（" + r.slice(6) + "）";
+  if (/_timeout$/.test(r)) return "時間切れになりました";
+  if (/_(401|403)\b/.test(r)) return "API キーが正しくないか、権限がありません（" + r.slice(0, 60) + "）";
+  if (/_429\b/.test(r) || /limit|quota|credits|searches/i.test(r)) return "API の回数上限に達しました（" + r.slice(0, 60) + "）";
+  return "エラー：" + r.slice(0, 120);
+}
+
+// ---------- エンジン・サイトの見た目 ----------
+const ENGINE_LABEL = { saucenao: "SauceNAO", tracemoe: "trace.moe", serpapi: "SerpApi", searchapi: "SearchApi", tineye: "TinEye", ris: "Reverse Image Search API" };
+const ENGINE_ORDER = ["saucenao", "tracemoe", "serpapi", "searchapi", "tineye", "ris"];
+const SITES = [
+  { key: "pixiv", label: "pixiv", re: /(^|\.)pixiv\.net$|(^|\.)pximg\.net$|fanbox\.cc$/ },
+  { key: "x", label: "X（Twitter）", re: /(^|\.)(twitter|x)\.com$|twimg\.com$|fxtwitter|vxtwitter/ },
+  { key: "danbooru", label: "Danbooru など", re: /danbooru|gelbooru|yande\.re|konachan|sankaku|safebooru|zerochan|e-shuushuu|anime-pictures/ },
+  { key: "anime", label: "アニメ", re: /anilist\.co|myanimelist\.net|trace\.moe|annict/ },
+  { key: "nico", label: "ニコニコ", re: /nicovideo\.jp|nicoseiga|seiga\.nicovideo/ },
+  { key: "art", label: "DeviantArt・ArtStation", re: /deviantart|artstation|behance/ },
+  { key: "sns", label: "SNS", re: /instagram|facebook|threads\.net|bsky|misskey|tumblr|reddit|pinterest|weibo|lofter/ },
+  { key: "shop", label: "ショップ", re: /booth\.pm|skeb\.jp|amazon\.|rakuten|melonbooks|toranoana|dlsite|fantia/ },
+];
+function siteOf(it) {
+  let h = "";
+  try { h = new URL(it.url).hostname.replace(/^www\./, ""); } catch { /* 無視 */ }
+  for (const s of SITES) if (s.re.test(h)) return { ...s, host: h };
+  return { key: "other", label: "そのほか", host: h };
+}
+const pxThumb = (u) => (u && /i\.pximg\.net/.test(u) ? `${FN}?pximg=${encodeURIComponent(u)}` : u);
+
+// ---------- 状態 ----------
+let INFO = null;
+let picked = null;      // { kind: "file", dataUrl, w, h, size } または { kind: "url", url }
+let running = false;
+let results = {};        // engine -> { state, items, reason, cached }
+let view = { tab: "all", site: "all" };
+let pixivInfo = {};
+
+// ---------- 画面の切りかえ ----------
+function go(name) {
+  $$(".screen").forEach((s) => s.classList.toggle("on", s.id === name));
+  if (name === "history") renderHistory();
+  if (name === "admin") renderAdmin();
+  window.scrollTo({ top: 0 });
+}
+function route() {
+  const h = location.hash.replace("#", "");
+  go(["history", "admin"].includes(h) ? h : "home");
+}
+document.addEventListener("click", (e) => {
+  const b = e.target.closest("[data-go]");
+  if (!b) return;
+  e.preventDefault();
+  const n = b.dataset.go;
+  if (n === "home") { history.pushState(null, "", location.pathname); route(); }
+  else location.hash = n;
+});
+window.addEventListener("hashchange", route);
+window.addEventListener("popstate", route);
+
+// ---------- アカウント ----------
+function renderAcct() {
+  const u = window.KaAccount && KaAccount.user();
+  const btn = $("#acctBtn");
+  btn.textContent = u ? (u.display_name || u.username || "アカウント") : "ログイン";
+  $("#adminLink").classList.toggle("hide", !(INFO && INFO.user && INFO.user.is_admin));
+}
+$("#acctBtn").onclick = () => {
+  if (!window.KaAccount) return toast("アカウント機能を読み込めませんでした");
+  KaAccount.isLoggedIn() ? KaAccount.openPanel() : KaAccount.login("login");
+};
+
+async function loadInfo() {
+  const r = await api("info");
+  if (!r.ok) { $("#quota").textContent = "サーバーに接続できませんでした"; return; }
+  INFO = r;
+  ENGINE_LABEL.ris = r.labels?.ris || ENGINE_LABEL.ris;
+  renderAcct();
+  renderEngines();
+  renderQuota();
+  const n = $("#notice");
+  n.textContent = r.notice || "";
+  n.classList.toggle("hide", !r.notice);
+  if (location.hash === "#admin") renderAdmin();
+}
+function renderQuota(used) {
+  if (!INFO) return;
+  if (used != null) INFO.used = used;
+  const q = $("#quota");
+  if (INFO.access === "admin" && !INFO.user?.is_admin) q.textContent = "いまは管理者だけが使えます";
+  else if (INFO.access === "login" && !INFO.user) q.innerHTML = `検索するには <a href="#" id="qLogin">ログイン</a> が必要です（かるわかGAMES アカウント）`;
+  else if (INFO.user?.is_admin) q.textContent = "管理者なので回数の上限はありません";
+  else q.textContent = `今日の検索：${INFO.used} ／ ${INFO.limit} 回` + (INFO.user ? "" : "（ログインすると増えます）");
+  const ql = $("#qLogin");
+  if (ql) ql.onclick = (e) => { e.preventDefault(); KaAccount?.login("login"); };
+}
+
+// エンジンのチェックボックス
+const pickKey = "imd_engines";
+function chosenEngines() {
+  return $$("#enginePick input:checked").map((i) => i.value);
+}
+function renderEngines() {
+  const on = new Set(INFO?.engines || []);
+  let saved = null;
+  try { saved = JSON.parse(localStorage.getItem(pickKey) || "null"); } catch { /* 無視 */ }
+  $("#enginePick").innerHTML = ENGINE_ORDER.map((e) => {
+    const ok = on.has(e);
+    const checked = ok && (!saved || !saved.off?.includes(e));
+    return `<label class="eng ${ok ? "" : "off"}" title="${ok ? "" : "管理者がまだ設定していません"}">
+      <input type="checkbox" value="${e}" ${checked ? "checked" : ""} ${ok ? "" : "disabled"}>${esc(ENGINE_LABEL[e])}${ok ? "" : "（未設定）"}</label>`;
+  }).join("");
+  $$("#enginePick input").forEach((i) => i.onchange = () => {
+    const off = $$("#enginePick input:not(:checked):not(:disabled)").map((x) => x.value);
+    localStorage.setItem(pickKey, JSON.stringify({ off }));
+    updateSearchBtn();
+  });
+  updateSearchBtn();
+}
+function updateSearchBtn() {
+  $("#searchBtn").disabled = running || !picked || !chosenEngines().length;
+}
+
+// ---------- 画像を選ぶ ----------
+const drop = $("#drop");
+drop.addEventListener("click", (e) => { if (!picked && !e.target.closest("button")) $("#file").click(); });
+drop.addEventListener("keydown", (e) => { if ((e.key === "Enter" || e.key === " ") && !picked) { e.preventDefault(); $("#file").click(); } });
+$("#file").onchange = (e) => { const f = e.target.files[0]; if (f) useFile(f); e.target.value = ""; };
+["dragenter", "dragover"].forEach((t) => drop.addEventListener(t, (e) => { e.preventDefault(); drop.classList.add("over"); }));
+["dragleave", "drop"].forEach((t) => drop.addEventListener(t, (e) => { e.preventDefault(); drop.classList.remove("over"); }));
+drop.addEventListener("drop", (e) => {
+  const f = [...(e.dataTransfer?.files || [])].find((x) => x.type.startsWith("image/"));
+  if (f) return useFile(f);
+  const u = e.dataTransfer?.getData("text/uri-list") || e.dataTransfer?.getData("text/plain");
+  if (u && /^https?:\/\//.test(u.trim())) useUrl(u.trim());
+});
+document.addEventListener("paste", (e) => {
+  if (!$("#home").classList.contains("on")) return;
+  if (e.target?.closest?.("input, textarea")) return;
+  const f = [...(e.clipboardData?.files || [])].find((x) => x.type.startsWith("image/"));
+  if (f) { e.preventDefault(); useFile(f); return; }
+  const t = e.clipboardData?.getData("text") || "";
+  if (/^https?:\/\/\S+$/.test(t.trim())) { e.preventDefault(); useUrl(t.trim()); }
+});
+$("#urlForm").onsubmit = (e) => {
+  e.preventDefault();
+  const u = $("#urlInput").value.trim();
+  if (!/^https?:\/\//.test(u)) return toast("http(s):// で始まる URL を入れてください");
+  useUrl(u);
+};
+$("#clearBtn").onclick = (e) => { e.stopPropagation(); clearPick(); };
+
+function clearPick() {
+  picked = null;
+  $("#dropEmpty").classList.remove("hide");
+  $("#dropPreview").classList.add("hide");
+  drop.classList.remove("has");
+  updateSearchBtn();
+}
+function showPreview(src, info) {
+  $("#previewImg").src = src;
+  $("#previewInfo").textContent = info;
+  $("#dropEmpty").classList.add("hide");
+  $("#dropPreview").classList.remove("hide");
+  drop.classList.add("has");
+  updateSearchBtn();
+}
+
+// 大きい画像は縮めて送る（長い辺 2400px・4MB まで。小さければそのまま）
+function readAsDataUrl(blob) {
+  return new Promise((ok, ng) => { const r = new FileReader(); r.onload = () => ok(r.result); r.onerror = ng; r.readAsDataURL(blob); });
+}
+function loadImg(src) {
+  return new Promise((ok, ng) => { const i = new Image(); i.onload = () => ok(i); i.onerror = ng; i.src = src; });
+}
+async function useFile(f) {
+  if (!f.type.startsWith("image/")) return toast("画像ファイルを選んでください");
+  if (f.size > 40 * 1024 * 1024) return toast("画像が大きすぎます（40MB まで）");
+  let dataUrl = await readAsDataUrl(f);
+  let img;
+  try { img = await loadImg(dataUrl); } catch { return toast("この画像は読み込めませんでした（HEIC などは JPEG に変換してください）"); }
+  const MAXS = 2400;
+  const okType = /^image\/(jpeg|png|webp|gif)$/.test(f.type);
+  if (!okType || f.size > 4 * 1024 * 1024 || Math.max(img.width, img.height) > MAXS) {
+    const sc = Math.min(1, MAXS / Math.max(img.width, img.height));
+    const c = document.createElement("canvas");
+    c.width = Math.round(img.width * sc); c.height = Math.round(img.height * sc);
+    const g = c.getContext("2d");
+    g.fillStyle = "#fff"; g.fillRect(0, 0, c.width, c.height);
+    g.drawImage(img, 0, 0, c.width, c.height);
+    dataUrl = c.toDataURL("image/jpeg", 0.92);
+  }
+  picked = { kind: "file", dataUrl, w: img.width, h: img.height, name: f.name };
+  showPreview(dataUrl, `${f.name || "貼り付けた画像"} ・ ${img.width}×${img.height} ・ ${(f.size / 1024 / 1024).toFixed(1)}MB`);
+}
+async function useUrl(u) {
+  picked = { kind: "url", url: u };
+  $("#urlInput").value = u;
+  const pid = /pixiv\.net/.test(u) && !/pximg/.test(u) ? (u.match(/artworks\/(\d+)/) || u.match(/illust_id=(\d+)/) || [])[1] : null;
+  if (pid) {
+    showPreview("icon.svg", "pixiv の作品を読み込み中…");
+    const r = await api("pixiv", { ids: [pid] });
+    const it = r.items?.[pid];
+    if (picked?.url !== u) return;
+    if (!it || it.error) { showPreview("icon.svg", "pixiv の作品の情報を取れませんでした（そのまま検索はできます）"); return; }
+    showPreview(pxThumb(it.regular || it.thumb), `pixiv「${it.title}」 ／ ${it.user}`);
+    picked.pixivSelf = pid;   // 自分で指定した作品は、結果の「いちばん有力」から外す
+    return;
+  }
+  showPreview(/pximg\.net/.test(u) ? pxThumb(u) : u, "URL から読み込みます");
+  $("#previewImg").onerror = () => { $("#previewImg").onerror = null; $("#previewImg").src = "icon.svg"; $("#previewInfo").textContent = "プレビューは出せませんが、そのまま検索できます"; };
+}
+
+// ---------- 検索 ----------
+$("#searchBtn").onclick = search;
+async function search() {
+  if (running || !picked) return;
+  const engines = chosenEngines();
+  if (!engines.length) return toast("検索エンジンを1つ以上選んでください");
+  if (INFO?.access === "login" && !INFO.user) { KaAccount?.login("login"); return toast(reasonText("auth")); }
+  running = true; updateSearchBtn();
+  results = {}; pixivInfo = {}; view = { tab: "all", site: "all" };
+  engines.forEach((e) => results[e] = { state: "wait", items: [] });
+  $("#results").classList.remove("hide");
+  $("#best").classList.add("hide"); $("#pixivBox").classList.add("hide");
+  renderResults();
+  $("#results").scrollIntoView({ behavior: "smooth", block: "start" });
+
+  const btn = $("#searchBtn");
+  const label = btn.innerHTML;
+  btn.innerHTML = "画像を送っています…";
+  const up = await api("upload", picked.kind === "file" ? { image: picked.dataUrl } : { url: picked.url });
+  btn.innerHTML = label;
+  if (!up.ok) {
+    running = false; updateSearchBtn();
+    $("#results").classList.add("hide");
+    if (up.reason === "auth") KaAccount?.login("login");
+    return toast(reasonText(up.reason), 5000);
+  }
+  renderQuota(up.used);
+  const list = engines.filter((e) => up.engines.includes(e));
+  engines.filter((e) => !list.includes(e)).forEach((e) => results[e] = { state: "ng", items: [], reason: "disabled" });
+  list.forEach((e) => results[e].state = "run");
+  renderResults();
+
+  await Promise.all(list.map(async (e) => {
+    const r = await api("search", { id: up.id, engine: e });
+    results[e] = r.ok ? { state: "ok", items: r.items || [], cached: r.cached } : { state: "ng", items: [], reason: r.reason };
+    renderResults();
+  }));
+  api("done", { id: up.id });
+  running = false; updateSearchBtn();
+  await loadPixiv();
+  saveHistory();
+}
+
+// ---------- 結果の表示 ----------
+function allItems() {
+  // エンジンごとの結果をまとめ、同じ URL は1つに（見つけたエンジンを並べる）
+  const map = new Map();
+  for (const e of ENGINE_ORDER) {
+    const r = results[e];
+    if (!r || r.state !== "ok") continue;
+    r.items.forEach((it, idx) => {
+      const key = it.pixiv_id ? "px:" + it.pixiv_id : it.url.replace(/^https?:\/\/(www\.)?/, "").replace(/[#?].*$/, "").replace(/\/$/, "");
+      const cur = map.get(key);
+      if (cur) {
+        if (!cur.engines.includes(e)) cur.engines.push(e);
+        if ((it.similarity ?? -1) > (cur.similarity ?? -1)) cur.similarity = it.similarity;
+        if (!cur.thumb && it.thumb) cur.thumb = it.thumb;
+        if (!cur.author && it.author) cur.author = it.author;
+      } else map.set(key, { ...it, engines: [e], rank: idx });
+    });
+  }
+  const arr = [...map.values()];
+  const score = (x) => (x.similarity ?? 55 - x.rank) + (x.engines.length - 1) * 8 + (x.pixiv_id ? 4 : 0);
+  return arr.sort((a, b) => score(b) - score(a));
+}
+function bestItem(items) {
+  // 似ている度が高い（85% 以上）SauceNAO・trace.moe の結果、または複数のエンジンが見つけたもの
+  const c = items.filter((x) => !x.pixiv_id || x.pixiv_id !== picked?.pixivSelf);
+  return c.find((x) => (x.similarity ?? 0) >= 85 && (x.engines.includes("saucenao") || x.engines.includes("tracemoe")))
+    || c.find((x) => x.engines.length >= 2) || null;
+}
+
+function renderResults() {
+  // 進み具合
+  $("#progress").innerHTML = Object.entries(results).map(([e, r]) => {
+    const t = r.state === "wait" ? "待機" : r.state === "run" ? "検索中…" : r.state === "ok" ? `${r.items.length}件${r.cached ? "（保存済み）" : ""}` : "失敗";
+    return `<span class="pg ${r.state}" title="${esc(r.reason ? reasonText(r.reason) : "")}"><span class="dot"></span>${esc(ENGINE_LABEL[e])} <small>${esc(t)}</small></span>`;
+  }).join("");
+
+  const items = allItems();
+  // いちばん有力
+  const best = running ? null : bestItem(items);
+  const b = $("#best");
+  if (best) {
+    const s = siteOf(best);
+    const px = best.pixiv_id && pixivInfo[best.pixiv_id];
+    const title = px && !px.error ? px.title : best.title;
+    const author = px && !px.error ? px.user : best.author;
+    b.innerHTML = `<img src="${esc(pxThumb((px && !px.error && px.thumb) || best.thumb || ""))}" alt="" referrerpolicy="no-referrer" onerror="this.style.visibility='hidden'">
+      <div><span class="label">いちばん有力</span>
+        <h3>${esc(title)}</h3>
+        <p>${esc(s.label === "そのほか" ? s.host : s.label)}${author ? " ・ " + esc(author) : ""}${best.similarity != null ? ` ・ 似ている度 ${best.similarity}%` : ""}${best.engines.length > 1 ? ` ・ ${best.engines.length}つのエンジンが一致` : ""}</p>
+        ${best.note ? `<p>${esc(best.note)}</p>` : ""}
+        <a class="btn sm" href="${esc(best.url)}" target="_blank" rel="noopener noreferrer">開く ↗</a></div>`;
+    b.classList.remove("hide");
+  } else b.classList.add("hide");
+
+  // タブ
+  const counts = { all: items.length };
+  for (const e of Object.keys(results)) counts[e] = results[e].items.length;
+  $("#tabs").innerHTML = [["all", "まとめ"], ...Object.keys(results).map((e) => [e, ENGINE_LABEL[e]])]
+    .map(([k, l]) => `<button class="tab ${view.tab === k ? "on" : ""}" data-tab="${k}">${esc(l)}<small>${counts[k] ?? 0}</small></button>`).join("");
+  $$("#tabs .tab").forEach((t) => t.onclick = () => { view.tab = t.dataset.tab; view.site = "all"; renderResults(); });
+
+  let shown = view.tab === "all" ? items : (results[view.tab]?.items || []).map((x) => ({ ...x, engines: [view.tab] }));
+  // サイトのしぼりこみ
+  const siteCount = {};
+  shown.forEach((x) => { const k = siteOf(x).key; siteCount[k] = (siteCount[k] || 0) + 1; });
+  const siteList = [...SITES, { key: "other", label: "そのほか" }].filter((s) => siteCount[s.key]);
+  $("#siteChips").innerHTML = siteList.length > 1
+    ? [`<button class="chip ${view.site === "all" ? "on" : ""}" data-site="all">すべて</button>`, ...siteList.map((s) => `<button class="chip ${view.site === s.key ? "on" : ""}" data-site="${s.key}">${esc(s.label)} ${siteCount[s.key]}</button>`)].join("")
+    : "";
+  $$("#siteChips .chip").forEach((c) => c.onclick = () => { view.site = c.dataset.site; renderResults(); });
+  if (view.site !== "all") shown = shown.filter((x) => siteOf(x).key === view.site);
+
+  // 一覧
+  const tab = view.tab !== "all" ? results[view.tab] : null;
+  $("#list").innerHTML = shown.map(card).join("");
+  const em = $("#emptyMsg");
+  const busy = Object.values(results).some((r) => r.state === "run" || r.state === "wait");
+  em.textContent = tab && tab.state === "ng" ? reasonText(tab.reason) : busy ? "検索しています…" : "見つかりませんでした。別のエンジンや、画像の一部を切り取って試してみてください。";
+  em.classList.toggle("hide", shown.length > 0);
+}
+
+function card(it) {
+  const s = siteOf(it);
+  const sim = it.similarity;
+  const simCls = sim == null ? "" : sim >= 80 ? "" : sim >= 60 ? "mid" : "low";
+  const px = it.pixiv_id && pixivInfo[it.pixiv_id] && !pixivInfo[it.pixiv_id].error ? pixivInfo[it.pixiv_id] : null;
+  const title = px ? px.title : it.title;
+  const author = px ? px.user : it.author;
+  const thumb = pxThumb(it.thumb || (px && px.thumb) || "");
+  const oldest = it.engines.includes("tineye") && it.date;
+  return `<a class="card" href="${esc(it.url)}" target="_blank" rel="noopener noreferrer">
+    ${thumb ? `<img class="th" src="${esc(thumb)}" alt="" loading="lazy" referrerpolicy="no-referrer" onerror="this.outerHTML='<div class=&quot;th none&quot;>?</div>'">` : `<div class="th none">?</div>`}
+    <div class="body">
+      <div class="title">${esc(title)}</div>
+      <div class="meta">
+        <span class="badge site-${s.key}">${esc(s.key === "other" ? s.host || "そのほか" : s.label)}</span>
+        ${sim != null ? `<span class="sim ${simCls}"><i><b style="width:${Math.max(4, Math.min(100, sim))}%"></b></i>${sim}%</span>` : ""}
+        ${author ? `<span>✎ ${esc(author)}</span>` : ""}
+        ${oldest ? `<span class="badge old">掲載 ${esc(it.date)}</span>` : it.date ? `<span>${esc(it.date)}</span>` : ""}
+        ${it.engines.map((e) => `<span class="badge eng">${esc(ENGINE_LABEL[e])}</span>`).join("")}
+      </div>
+      ${it.note ? `<div class="note">${esc(it.note)}</div>` : ""}
+      <div class="url">${esc(it.url)}</div>
+    </div></a>`;
+}
+
+// pixiv の作品の情報（タイトル・作者・タグ）をまとめて取る
+async function loadPixiv() {
+  const ids = [...new Set(allItems().map((x) => x.pixiv_id).filter(Boolean))].filter((id) => id !== picked?.pixivSelf).slice(0, 8);
+  if (!ids.length) { renderResults(); return; }
+  const r = await api("pixiv", { ids });
+  if (r.ok) pixivInfo = r.items || {};
+  const box = $("#pixivBox");
+  $("#pixivList").innerHTML = ids.map((id) => {
+    const p = pixivInfo[id] || {};
+    const fromItem = allItems().find((x) => x.pixiv_id === id) || {};
+    const ok = p && !p.error;
+    const img = ok && !p.adult ? pxThumb(p.thumb) : (fromItem.thumb || "");
+    return `<a class="px-card" href="https://www.pixiv.net/artworks/${id}" target="_blank" rel="noopener noreferrer">
+      ${img ? `<img src="${esc(img)}" alt="" loading="lazy" referrerpolicy="no-referrer">` : `<div class="r18">pixiv</div>`}
+      <div class="t">${esc(ok ? p.title : fromItem.title || "作品 " + id)}</div>
+      <div class="u">${esc(ok ? p.user : fromItem.author || "")}${ok && p.date ? " ・ " + esc(p.date) : ""}</div></a>`;
+  }).join("");
+  box.classList.remove("hide");
+  renderResults();
+}
+
+// ---------- 履歴（この端末だけ） ----------
+const HKEY = "imd_history";
+function loadHist() { try { return JSON.parse(localStorage.getItem(HKEY) || "[]"); } catch { return []; } }
+async function saveHistory() {
+  const items = allItems();
+  const best = bestItem(items) || items[0];
+  let thumb = "";
+  try {
+    const src = picked?.kind === "file" ? picked.dataUrl : null;
+    if (src) {
+      const img = await loadImg(src);
+      const c = document.createElement("canvas"); const sz = 96;
+      const sc = Math.max(sz / img.width, sz / img.height);
+      c.width = sz; c.height = sz;
+      c.getContext("2d").drawImage(img, (sz - img.width * sc) / 2, (sz - img.height * sc) / 2, img.width * sc, img.height * sc);
+      thumb = c.toDataURL("image/jpeg", 0.7);
+    }
+  } catch { /* 無視 */ }
+  const h = loadHist();
+  h.unshift({
+    at: Date.now(), thumb, src: picked?.kind === "url" ? picked.url : "", count: items.length,
+    best: best ? { title: (best.pixiv_id && pixivInfo[best.pixiv_id]?.title) || best.title, url: best.url, site: siteOf(best).label } : null,
+  });
+  try { localStorage.setItem(HKEY, JSON.stringify(h.slice(0, 30))); } catch { /* 容量オーバーは無視 */ }
+}
+function renderHistory() {
+  const h = loadHist();
+  $("#histList").innerHTML = h.length ? h.map((x) => `<div class="hist-item">
+      <img src="${esc(x.thumb || "icon.svg")}" alt="">
+      <div><div class="t">${x.best ? esc(x.best.title) : "見つかりませんでした"}</div>
+        <div class="d">${new Date(x.at).toLocaleString("ja-JP")} ・ ${x.count}件${x.best ? " ・ " + esc(x.best.site) : ""}</div>
+        ${x.best ? `<a href="${esc(x.best.url)}" target="_blank" rel="noopener noreferrer">開く ↗</a>` : ""}</div></div>`).join("")
+    : `<p class="fine">まだ履歴はありません。</p>`;
+}
+$("#histClear").onclick = () => { if (confirm("履歴をすべて消しますか？")) { localStorage.removeItem(HKEY); renderHistory(); } };
+
+// ---------- admin ----------
+const ENGINE_ADMIN = [
+  { e: "saucenao", key: "saucenao_key", link: "https://saucenao.com/user.php?page=search-api", desc: "イラスト・pixiv・Danbooru・漫画向け。無料アカウントでもキーがもらえます（1日の回数に上限あり）。" },
+  { e: "tracemoe", key: "tracemoe_key", link: "https://soruly.github.io/trace.moe-api/", desc: "アニメの場面検索。キーなしでも使えます（回数が少なめ）。キーを入れると上限が増えます。", optional: true },
+  { e: "serpapi", key: "serpapi_key", link: "https://serpapi.com/manage-api-key", desc: "Google レンズなどを API で使えます。", mode: "serpapi_engine",
+    modes: [["google_lens", "Google レンズ（似た画像）"], ["google_lens_exact", "Google レンズ（完全一致）"], ["google_reverse_image", "Google 逆画像検索"], ["yandex_images", "Yandex 画像"], ["bing_reverse_image", "Bing 逆画像（Enterprise のみ）"]] },
+  { e: "searchapi", key: "searchapi_key", link: "https://www.searchapi.io/", desc: "SerpApi と同じく、Google レンズなどを使えます。", mode: "searchapi_engine",
+    modes: [["google_lens", "Google レンズ（似た画像）"], ["google_lens_exact", "Google レンズ（完全一致）"], ["google_reverse_image", "Google 逆画像検索"], ["yandex_reverse_image", "Yandex 逆画像"], ["bing_reverse_image", "Bing 逆画像"]] },
+  { e: "tineye", key: "tineye_key", link: "https://services.tineye.com/TinEyeAPI", desc: "同じ画像が載っているページを、掲載の古い順に出します。元の投稿を探すのに便利（有料）。" },
+  { e: "ris", key: "ris_key", link: "", desc: "そのほかの逆画像検索 API（RapidAPI・Zyla など）。URL のひな形と認証のしかたを決めると使えます。結果の形は自動で読み取ります。", ris: true },
+];
+
+async function renderAdmin() {
+  const body = $("#adminBody");
+  if (!token()) { body.innerHTML = `<div class="panel"><p>admin 画面を使うには、管理者の かるわかGAMES アカウントでログインしてください。</p><button class="btn" id="admLogin">ログイン</button></div>`; $("#admLogin").onclick = () => KaAccount?.login("login"); return; }
+  const r = await rpc("imd_admin_get", { p_token: token() }).catch(() => null);
+  if (!r || !r.ok) { body.innerHTML = `<div class="panel"><p>${r && r.reason === "forbidden" ? "このアカウントは管理者ではありません。" : "読み込めませんでした。"}</p></div>`; return; }
+  const st = r.settings || {}, sec = r.secrets || {};
+  const secretInput = (name, ph) => `<label>API キー ${sec[name] ? `<span class="set">設定済み ${esc(sec[name])}</span>` : `<span class="unset">未設定</span>`}
+    <span class="row"><input class="grow" type="password" autocomplete="new-password" data-k="${name}" placeholder="${esc(ph || (sec[name] ? "変えるときだけ入力" : "キーを貼り付け"))}">
+    <button class="btn sm" data-save="${name}">保存</button>${sec[name] ? `<button class="btn ghost sm" data-del="${name}">削除</button>` : ""}</span></label>`;
+  const textInput = (name, label, ph, hint = "") => `<label>${label}${hint ? `<span class="hint">${hint}</span>` : ""}<span class="row"><input class="grow" type="text" data-k="${name}" value="${esc(st[name] || "")}" placeholder="${esc(ph)}"><button class="btn sm" data-save="${name}">保存</button></span></label>`;
+  const sel = (name, label, opts, def) => `<label>${label}<span class="row"><select data-k="${name}" data-autosave>${opts.map(([v, l]) => `<option value="${v}" ${(st[name] || def) === v ? "selected" : ""}>${esc(l)}</option>`).join("")}</select></span></label>`;
+
+  const engines = ENGINE_ADMIN.map((x) => {
+    const onv = (st["engine_" + x.e] || "on") !== "off";
+    return `<div class="eng-admin">
+      <header><h3>${esc(x.e === "ris" ? (st.ris_label || ENGINE_LABEL.ris) : ENGINE_LABEL[x.e])}${x.link ? `<a href="${x.link}" target="_blank" rel="noopener">キーの取得 ↗</a>` : ""}</h3>
+        <label class="switch"><input type="checkbox" data-engine-on="${x.e}" ${onv ? "checked" : ""}>使う</label></header>
+      <p class="fine" style="margin:0">${esc(x.desc)}</p>
+      <div class="kv">
+        ${x.ris ? textInput("ris_label", "表示名", "Reverse Image Search API") + textInput("ris_endpoint", "URL のひな形", "https://example.com/search?url={url}", "{url} が画像の URL に置きかわります（{key} も使えます）") +
+          sel("ris_auth", "キーの渡し方", [["bearer", "Authorization: Bearer キー"], ["header:X-API-Key", "ヘッダー X-API-Key"], ["header:x-rapidapi-key", "RapidAPI（x-rapidapi-key）"], ["query:api_key", "URL に ?api_key=キー"], ["query:key", "URL に ?key=キー"]], "bearer") : ""}
+        ${secretInput(x.key, x.optional ? "（なくても使えます）" : "")}
+        ${x.mode ? sel(x.mode, "検索のしかた", x.modes, "google_lens") : ""}
+      </div>
+      <div class="row"><button class="btn ghost sm" data-test="${x.e}">テストする</button><span class="fine">${x.e === "tracemoe" ? "" : "※ テストでも1回分の回数を使います"}</span></div>
+      <div class="test-out hide" data-out="${x.e}"></div>
+    </div>`;
+  }).join("");
+
+  const stats = r.stats || [];
+  body.innerHTML = `
+    <div class="grid2">
+      <div class="panel"><p class="fine">今日の検索</p><div class="big-n">${r.searches_today}</div></div>
+      <div class="panel"><p class="fine">7日間に使った人（ゲストは IP ごと）</p><div class="big-n">${r.searchers_7d}</div></div>
+      <div class="panel"><p class="fine">保存済みの結果（同じ画像は API を使わない）</p><div class="big-n">${r.cache}</div><button class="btn ghost sm" id="clearCache">保存済みの結果を消す</button></div>
+    </div>
+    <div class="panel"><h2>検索エンジン</h2><p class="fine">API キーは暗号化してサーバーに保存されます。画面やブラウザには最後の4文字しか出ません。</p>
+      <div class="kv">${engines}</div></div>
+    <div class="panel"><h2>使える人・回数</h2><div class="kv">
+      ${sel("access", "検索できる人", [["login", "ログインした人だけ（おすすめ）"], ["all", "だれでも（ゲストも）"], ["admin", "管理者だけ"]], "login")}
+      ${textInput("daily_limit", "ログインした人の1日の回数", "20", "0 にすると無制限。1回の検索で選んだエンジンを全部使います")}
+      ${textInput("guest_daily_limit", "ゲストの1日の回数（IP ごと）", "3")}
+      ${textInput("cache_days", "同じ画像の結果を使い回す日数", "7", "0 にすると毎回 API を呼びます")}
+      ${textInput("min_similarity", "SauceNAO の似ている度の下限（%）", "0", "これより低い結果は出しません")}
+      <label class="switch"><input type="checkbox" id="hideAdult" ${st.hide_adult === "off" ? "" : "checked"}>成人向けの結果を隠す（SauceNAO・trace.moe）</label>
+      <label>お知らせ（検索画面の上に出ます）<span class="row"><textarea class="grow" rows="2" data-k="notice" placeholder="なし">${esc(st.notice || "")}</textarea><button class="btn sm" data-save="notice">保存</button></span></label>
+    </div></div>
+    <div class="panel"><h2>この7日間のエンジン別</h2>
+      ${stats.length ? `<table class="stats"><tr><th>日付</th><th>エンジン</th><th>API 呼び出し</th><th>使い回し</th><th>失敗</th></tr>${stats.map((s) => `<tr><td>${esc(s.day)}</td><td>${esc(ENGINE_LABEL[s.engine] || s.engine)}</td><td class="n">${s.calls}</td><td class="n">${s.cached}</td><td class="n">${s.errors}</td></tr>`).join("")}</table>` : `<p class="fine">まだ記録はありません。</p>`}
+    </div>
+    <div class="panel"><h2>最近のエラー</h2>
+      ${(r.errors || []).length ? `<table class="stats">${r.errors.map((x) => `<tr><td>${new Date(x.at).toLocaleString("ja-JP")}</td><td>${esc(ENGINE_LABEL[x.engine] || x.engine)}</td><td>${esc(x.info)}</td></tr>`).join("")}</table>` : `<p class="fine">ありません。</p>`}
+    </div>
+    <p class="fine">v${VERSION}</p>`;
+
+  const save = async (name, value) => {
+    const x = await rpc("imd_admin_set", { p_token: token(), p_name: name, p_value: value }).catch(() => null);
+    if (x && x.ok) { toast("保存しました"); return true; }
+    toast("保存できませんでした" + (x?.reason ? "（" + x.reason + "）" : "")); return false;
+  };
+  $$("[data-save]", body).forEach((b) => b.onclick = async () => {
+    const k = b.dataset.save, inp = $(`[data-k="${k}"]`, body);
+    if (inp.type === "password" && !inp.value.trim()) return toast("キーを入力してください");
+    if (await save(k, inp.value)) { renderAdmin(); loadInfo(); }
+  });
+  $$("[data-del]", body).forEach((b) => b.onclick = async () => {
+    if (!confirm("このキーを削除しますか？")) return;
+    if (await save(b.dataset.del, "")) { renderAdmin(); loadInfo(); }
+  });
+  $$("[data-autosave]", body).forEach((s) => s.onchange = async () => { if (await save(s.dataset.k, s.value)) loadInfo(); });
+  $$("[data-engine-on]", body).forEach((c) => c.onchange = async () => { if (await save("engine_" + c.dataset.engineOn, c.checked ? "on" : "off")) loadInfo(); });
+  $("#hideAdult").onchange = async (e) => { await save("hide_adult", e.target.checked ? "on" : "off"); };
+  $("#clearCache").onclick = async () => { if (confirm("保存済みの結果をすべて消しますか？")) { await save("clear_cache", "1"); renderAdmin(); } };
+  $$("[data-test]", body).forEach((b) => b.onclick = async () => {
+    const e = b.dataset.test, out = $(`[data-out="${e}"]`, body);
+    out.classList.remove("hide"); out.textContent = "テスト中…（見本の画像で検索しています）";
+    b.disabled = true;
+    const x = await api("admin_test", { engine: e });
+    b.disabled = false;
+    out.textContent = x.ok
+      ? `✅ 動きました（${x.count}件・${(x.ms / 1000).toFixed(1)}秒）\n` + (x.sample || []).map((s) => `・${s.title}  ${s.url}`).join("\n")
+      : `❌ ${reasonText(x.reason)}\n${x.reason || ""}`;
+  });
+}
+
+// ---------- 起動 ----------
+(async function start() {
+  route();
+  if (window.KaAccount) {
+    await Promise.race([KaAccount.ready, sleep(4000)]).catch(() => {});
+    KaAccount.onChange(() => { renderAcct(); loadInfo(); });
+  }
+  renderAcct();
+  await loadInfo();
+})();

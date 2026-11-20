@@ -1,0 +1,127 @@
+<!DOCTYPE html>
+<html lang="ja">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>画像どこかな検索 ― 画像の出どころ（ソース）を探す</title>
+<meta name="description" content="画像を選ぶだけで、出どころ（ソース）を探せます。pixiv・X・Danbooru・アニメの場面など、いくつもの検索エンジンでまとめて調べます。">
+<meta property="og:title" content="画像どこかな検索">
+<meta property="og:description" content="画像を選ぶだけで、出どころ（ソース）をまとめて探せます。pixiv にも対応。">
+<meta name="theme-color" content="#1f2a44">
+<link rel="icon" href="icon.svg" type="image/svg+xml">
+<link rel="preconnect" href="https://fonts.googleapis.com">
+<link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
+<link href="https://fonts.googleapis.com/css2?family=Zen+Kaku+Gothic+New:wght@400;500;700;900&display=swap" rel="stylesheet">
+<link rel="stylesheet" href="style.css?v=1.0.0">
+<script src="https://kaikomziu.github.io/game-links/js/karuwaka-account.js" data-game="gazou-doko" data-badge="off"></script>
+</head>
+<body>
+<header class="top">
+  <a class="brand" href="#" data-go="home">
+    <span class="logo" aria-hidden="true"><svg viewBox="0 0 40 40"><rect x="4" y="7" width="24" height="20" rx="3" fill="none" stroke="currentColor" stroke-width="3"/><path d="M8 23l6-7 4 4 3-3 4 6" fill="none" stroke="currentColor" stroke-width="2.4" stroke-linejoin="round"/><circle cx="27" cy="26" r="7" fill="var(--bg)" stroke="var(--accent)" stroke-width="3.2"/><path d="M32 31l5 5" stroke="var(--accent)" stroke-width="3.6" stroke-linecap="round"/></svg></span>
+    <span class="name">画像どこかな検索</span>
+  </a>
+  <nav class="nav">
+    <button class="link" data-go="history">履歴</button>
+    <button class="link hide" id="adminLink" data-go="admin">admin</button>
+    <button class="acct" id="acctBtn">ログイン</button>
+  </nav>
+</header>
+
+<main>
+  <!-- ホーム（検索） -->
+  <section id="home" class="screen on">
+    <div class="hero">
+      <h1>その画像、<em>どこから</em>来たの？</h1>
+      <p class="lead">画像を選ぶと、いくつもの検索エンジンでまとめて出どころを探します。<br>pixiv・X・Danbooru・アニメの場面まで。</p>
+    </div>
+
+    <div id="notice" class="notice hide"></div>
+
+    <div id="drop" class="drop" tabindex="0" role="button" aria-label="画像を選ぶ">
+      <input type="file" id="file" accept="image/*" hidden>
+      <div class="drop-empty" id="dropEmpty">
+        <div class="drop-icon" aria-hidden="true">
+          <svg viewBox="0 0 48 48"><path d="M24 31V11M15 20l9-9 9 9" fill="none" stroke="currentColor" stroke-width="3.5" stroke-linecap="round" stroke-linejoin="round"/><path d="M8 30v7a3 3 0 003 3h26a3 3 0 003-3v-7" fill="none" stroke="currentColor" stroke-width="3.5" stroke-linecap="round"/></svg>
+        </div>
+        <p class="drop-title">ここに画像をドロップ</p>
+        <p class="drop-sub">クリックして選ぶ ／ <kbd>Ctrl</kbd>+<kbd>V</kbd> で貼り付け</p>
+      </div>
+      <div class="drop-preview hide" id="dropPreview">
+        <img id="previewImg" alt="選んだ画像">
+        <div class="preview-meta">
+          <span id="previewInfo"></span>
+          <button class="btn ghost sm" id="clearBtn">別の画像にする</button>
+        </div>
+      </div>
+    </div>
+
+    <form class="url-row" id="urlForm">
+      <input type="url" id="urlInput" placeholder="または画像の URL ／ pixiv の作品ページの URL を貼る" autocomplete="off">
+      <button class="btn ghost" type="submit">読み込む</button>
+    </form>
+
+    <div class="engines" id="enginePick"></div>
+
+    <div class="go-row">
+      <button class="btn big" id="searchBtn" disabled>
+        <svg viewBox="0 0 24 24" aria-hidden="true"><circle cx="10.5" cy="10.5" r="6.5" fill="none" stroke="currentColor" stroke-width="2.6"/><path d="M15.5 15.5L21 21" stroke="currentColor" stroke-width="2.8" stroke-linecap="round"/></svg>
+        出どころを探す
+      </button>
+      <p class="quota" id="quota"></p>
+    </div>
+
+    <!-- 結果 -->
+    <div id="results" class="results hide">
+      <div class="progress" id="progress"></div>
+
+      <div id="best" class="best hide"></div>
+
+      <div id="pixivBox" class="pixiv-box hide">
+        <h2 class="sec"><span class="px">P</span>pixiv で見つかった作品</h2>
+        <div class="px-list" id="pixivList"></div>
+      </div>
+
+      <div class="tabs" id="tabs"></div>
+      <div class="chips" id="siteChips"></div>
+      <div class="list" id="list"></div>
+      <p class="empty hide" id="emptyMsg">まだ見つかっていません。</p>
+    </div>
+
+    <section class="how">
+      <h2 class="sec">使っている検索エンジン</h2>
+      <div class="how-grid">
+        <div><b>SauceNAO</b><span>イラスト・pixiv・Danbooru・漫画に強い</span></div>
+        <div><b>trace.moe</b><span>アニメのスクショから作品名と話数・時間</span></div>
+        <div><b>Google レンズ</b><span>SerpApi ／ SearchApi 経由。ネット全体から</span></div>
+        <div><b>TinEye</b><span>同じ画像の載っているページ。いちばん古い掲載がわかる</span></div>
+        <div><b>Reverse Image Search API</b><span>そのほかの逆画像検索</span></div>
+      </div>
+      <p class="fine">※ 選んだ画像は、検索のために各サービスへ送られます。こちらのサーバーには最大30分だけ置き、検索が終わったら消します。個人情報が写った画像は使わないでください。</p>
+    </section>
+  </section>
+
+  <!-- 履歴 -->
+  <section id="history" class="screen">
+    <h1 class="page">検索の履歴</h1>
+    <p class="fine">この端末だけに保存されます（最新30件）。</p>
+    <div class="hist" id="histList"></div>
+    <button class="btn ghost sm" id="histClear">履歴をすべて消す</button>
+  </section>
+
+  <!-- admin -->
+  <section id="admin" class="screen">
+    <h1 class="page">admin 画面</h1>
+    <div id="adminBody"><p class="fine">読み込み中…</p></div>
+  </section>
+</main>
+
+<footer class="foot">
+  <span>画像どこかな検索 <span class="ver">v1.0.0</span></span>
+  <span>by かるわか ・ <a href="https://kaikomziu.github.io/game-links/" target="_blank" rel="noopener">かるわかGAMES</a></span>
+</footer>
+
+<div id="toast" class="toast" role="status"></div>
+<script type="module" src="app.js?v=1.0.0"></script>
+</body>
+</html>

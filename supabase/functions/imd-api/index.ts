@@ -60,6 +60,7 @@ const enabled = (cfg: Config, e: Engine) => {
 type Item = {
   title: string; url: string; thumb?: string; site?: string; similarity?: number | null;
   author?: string; author_url?: string; note?: string; date?: string; pixiv_id?: string; video?: string;
+  adult?: boolean;   // 成人向けの印（SauceNAO・trace.moe だけが教えてくれる）
 };
 
 // URL から pixiv の作品 ID を取り出す
@@ -83,6 +84,7 @@ function item(o: Partial<Item> & { url: string }): Item {
   if (o.video && isHttp(o.video)) it.video = clip(o.video, 1500);
   const pid = o.pixiv_id || pixivId(o.url);
   if (pid) it.pixiv_id = String(pid);
+  if (o.adult) it.adult = true;
   return it;
 }
 
@@ -106,9 +108,19 @@ async function getJson(url: string, init: RequestInit = {}, engine = "") {
   } finally { clearTimeout(t); }
 }
 
+// ---- 成人向けの扱い ----
+// 管理者の設定 adult_mode: hide=だれにも出さない／login=ログインした人が選べる／all=だれでも選べる
+// 利用者が「ぼかす」「表示する」を選んだときだけ、成人向けの結果も取ってくる（この検索のあいだだけ cfg に印をつける）
+function adultMode(cfg: Config) {
+  const m = cfg.settings.adult_mode;
+  if (m === "hide" || m === "login" || m === "all") return m;
+  return cfg.settings.hide_adult === "off" ? "all" : "login";
+}
+const showAdult = (cfg: Config) => cfg.settings._adult === "1";
+
 // ---- SauceNAO（イラスト・pixiv・Danbooru など） ----
 async function saucenao(cfg: Config, imgUrl: string): Promise<Item[]> {
-  const hide = cfg.settings.hide_adult === "off" ? 0 : 3;
+  const hide = showAdult(cfg) ? 0 : 3;
   const q = new URLSearchParams({ output_type: "2", numres: "16", db: "999", hide: String(hide), api_key: cfg.secrets.saucenao_key, url: imgUrl });
   const d = await getJson(`https://saucenao.com/search.php?${q}`, { headers: { "User-Agent": UA } }, "saucenao");
   const header = d.header as Record<string, unknown> | undefined;
@@ -124,16 +136,17 @@ async function saucenao(cfg: Config, imgUrl: string): Promise<Item[]> {
     const creator = Array.isArray(x.creator) ? (x.creator as string[]).join(", ") : x.creator;
     const index = String(h.index_name || "").replace(/^Index #\d+:\s*/, "").replace(/\s*-\s*.*$/, "");
     const chars = clip(x.characters, 100), mat = clip(x.material, 100);
+    const adult = Number(h.hidden) > 0;
     out.push(item({
       url, title: String(x.title || x.jp_name || x.eng_name || (!src && x.source) || mat || index),
       thumb: String(h.thumbnail || ""), similarity: parseFloat(String(h.similarity)),
       author: String(x.member_name || x.author_name || creator || x.artist || "") || undefined,
       author_url: x.member_id && x.pixiv_id ? `https://www.pixiv.net/users/${x.member_id}` : undefined,
       note: [index, mat && `作品: ${mat}`, chars && `キャラ: ${chars}`, src && src !== url ? `出典: ${src}` : ""].filter(Boolean).join(" ／ "),
-      pixiv_id: x.pixiv_id ? String(x.pixiv_id) : undefined,
+      pixiv_id: x.pixiv_id ? String(x.pixiv_id) : undefined, adult,
     }));
     // ext_urls が複数ある（Danbooru と pixiv など）ときは、2つ目以降も別の行で出す
-    for (const u2 of urls.slice(1, 3)) if (u2 !== url) out.push(item({ url: u2, title: index, thumb: String(h.thumbnail || ""), similarity: parseFloat(String(h.similarity)) }));
+    for (const u2 of urls.slice(1, 3)) if (u2 !== url) out.push(item({ url: u2, title: index, thumb: String(h.thumbnail || ""), similarity: parseFloat(String(h.similarity)), adult }));
   }
   const min = Number(cfg.settings.min_similarity || 0);
   return out.filter((i) => i.similarity == null || i.similarity >= min);
@@ -146,7 +159,7 @@ async function tracemoe(cfg: Config, imgUrl: string): Promise<Item[]> {
   if (cfg.secrets.tracemoe_key) headers["x-trace-key"] = cfg.secrets.tracemoe_key;
   const d = await getJson(`https://api.trace.moe/search?anilistInfo&cutBorders&url=${encodeURIComponent(imgUrl)}`, { headers }, "tracemoe");
   if (d.error) throw new Error("tracemoe_" + clip(d.error, 120));
-  const hideAdult = cfg.settings.hide_adult !== "off";
+  const hideAdult = !showAdult(cfg);
   const out: Item[] = [];
   for (const r of ((d.result as Record<string, unknown>[]) || []).slice(0, 10)) {
     const al = (r.anilist || {}) as Record<string, unknown>;
@@ -157,7 +170,7 @@ async function tracemoe(cfg: Config, imgUrl: string): Promise<Item[]> {
       url: al.id ? `https://anilist.co/anime/${al.id}` : String(r.video || ""),
       title: t.native || t.romaji || t.english || String(r.filename || "不明なアニメ"),
       thumb: String(r.image || ""), video: String(r.video || ""), site: "trace.moe",
-      similarity: Number(r.similarity) * 100,
+      similarity: Number(r.similarity) * 100, adult: !!al.isAdult,
       note: [ep, `${tm(Number(r.from) || 0)} ごろ`, t.romaji && t.romaji !== t.native ? t.romaji : ""].filter(Boolean).join(" ／ "),
     }));
   }
@@ -379,7 +392,7 @@ Deno.serve(async (req) => {
         engines: ENGINES.filter((e) => enabled(cfg, e)),
         labels: { ris: cfg.settings.ris_label || "Reverse Image Search API" },
         modes: { serpapi: cfg.settings.serpapi_engine || "google_lens", searchapi: cfg.settings.searchapi_engine || "google_lens" },
-        notice: cfg.settings.notice || "",
+        notice: cfg.settings.notice || "", adult_mode: adultMode(cfg),
       });
     }
 
@@ -428,8 +441,12 @@ Deno.serve(async (req) => {
       const { data: cl } = await sb.rpc("imd_internal_claim", { p_id: id, p_engine: engine });
       const claim = cl as { ok: boolean; reason?: string; path: string; sha: string };
       if (!claim?.ok) return json({ ok: false, reason: claim?.reason || "expired" });
+      // 成人向け：管理者が許していて、利用者が選んだときだけ
+      const am = adultMode(cfg);
+      const wantAdult = body.adult === true && (am === "all" || (am === "login" && !!acc));
+      cfg.settings._adult = wantAdult ? "1" : "";
       const mode = engine === "serpapi" ? cfg.settings.serpapi_engine || "" : engine === "searchapi" ? cfg.settings.searchapi_engine || "" : engine === "ris" ? cfg.settings.ris_endpoint || "" : "";
-      const ckey = engine + (mode ? ":" + mode.slice(0, 80) : "") + (cfg.settings.hide_adult === "off" ? ":a" : "");
+      const ckey = engine + (mode ? ":" + mode.slice(0, 80) : "") + (wantAdult ? ":a" : "");
       const days = Number(cfg.settings.cache_days ?? 7);
       if (days > 0) {
         const { data: hit } = await sb.from("imd_cache").select("result, created_at").eq("sha", claim.sha).eq("engine", ckey).maybeSingle();

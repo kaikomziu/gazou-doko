@@ -1,5 +1,5 @@
 // 画像どこかな検索 ― 画面の動き
-const VERSION = "1.0.0";
+const VERSION = "1.1.0";
 const SUPA = "https://kifnzvktwbomxthzvvgy.supabase.co";
 // 公開用の anon key（かるわかGAMES の SDK と同じ。公開しても問題ないキー）
 const ANON = "eyJhbGciOiJIUzI1NiIsInR5cCI6IkpXVCJ9.eyJpc3MiOiJzdXBhYmFzZSIsInJlZiI6ImtpZm56dmt0d2JvbXh0aHp2dmd5Iiwicm9sZSI6ImFub24iLCJpYXQiOjE3Nzc4MzgxMzgsImV4cCI6MjA5MzQxNDEzOH0.M7nXP-u--6J_6rRpgz1cJj21_7KX6MtfTmZy77Xf_IE";
@@ -87,6 +87,49 @@ let running = false;
 let results = {};        // engine -> { state, items, reason, cached }
 let view = { tab: "all", site: "all" };
 let pixivInfo = {};
+let searchAdult = "hide";  // 検索したときの成人向けの設定（hide のときはサーバーも成人向けを取ってこない）
+
+// ---------- 成人向けの表示設定（hide=隠す／blur=ぼかす／show=表示する） ----------
+const AKEY = "imd_adult", AOK = "imd_adult_ok";
+function adultAllowed() {
+  const m = INFO?.adult_mode || "login";
+  return m === "all" || (m === "login" && !!INFO?.user);
+}
+function adultPref() {
+  const v = localStorage.getItem(AKEY);
+  return adultAllowed() && (v === "blur" || v === "show") ? v : "hide";
+}
+// いま表示に使う設定（サーバーが取ってこなかったものは出せないので、検索時の設定もみる）
+const adultView = () => (searchAdult === "hide" ? "hide" : adultPref());
+function renderAdult() {
+  const row = $("#adultRow");
+  if (!row || !INFO) return;
+  const m = INFO.adult_mode || "login";
+  const ok = adultAllowed(), cur = adultPref();
+  row.classList.toggle("locked", !ok);
+  $$("#adultRow [data-adult]").forEach((b) => {
+    b.classList.toggle("on", b.dataset.adult === cur);
+    b.setAttribute("aria-checked", b.dataset.adult === cur ? "true" : "false");
+    b.disabled = !ok && b.dataset.adult !== "hide";
+  });
+  $("#adultNote").textContent = m === "hide" ? "管理者の設定で、成人向けの結果は表示しません"
+    : !ok ? "ログインすると選べます（18歳以上の方のみ）"
+    : cur !== "hide" ? "R-18 の印が付くのは SauceNAO・trace.moe・pixiv の結果だけです"
+    : "Google レンズなどの結果は判定できないため、まれに成人向けが出ることがあります";
+}
+$$("#adultRow [data-adult]").forEach((b) => b.onclick = () => {
+  const v = b.dataset.adult;
+  if (!adultAllowed() && v !== "hide") return;
+  if (v !== "hide" && localStorage.getItem(AOK) !== "1") {
+    if (!confirm("成人向け（R-18）の結果は、18歳以上の方だけが見られます。\nあなたは18歳以上ですか？")) return;
+    localStorage.setItem(AOK, "1");
+  }
+  localStorage.setItem(AKEY, v);
+  renderAdult();
+  if (v !== "hide" && searchAdult === "hide" && Object.keys(results).length) toast("成人向けの結果は、次の検索から含まれます");
+  if (Object.keys(results).length) { renderResults(); renderPixiv(); }
+});
+const isAdult = (it) => !!(it.adult || (it.pixiv_id && pixivInfo[it.pixiv_id]?.adult));
 
 // ---------- 画面の切りかえ ----------
 function go(name) {
@@ -130,6 +173,7 @@ async function loadInfo() {
   renderAcct();
   renderEngines();
   renderQuota();
+  renderAdult();
   const n = $("#notice");
   n.textContent = r.notice || "";
   n.classList.toggle("hide", !r.notice);
@@ -271,7 +315,8 @@ async function search() {
   if (!engines.length) return toast("検索エンジンを1つ以上選んでください");
   if (INFO?.access === "login" && !INFO.user) { KaAccount?.login("login"); return toast(reasonText("auth")); }
   running = true; updateSearchBtn();
-  results = {}; pixivInfo = {}; view = { tab: "all", site: "all" };
+  results = {}; pixivInfo = {}; pixivIds = []; view = { tab: "all", site: "all" };
+  searchAdult = adultPref();
   engines.forEach((e) => results[e] = { state: "wait", items: [] });
   $("#results").classList.remove("hide");
   $("#best").classList.add("hide"); $("#pixivBox").classList.add("hide");
@@ -296,7 +341,7 @@ async function search() {
   renderResults();
 
   await Promise.all(list.map(async (e) => {
-    const r = await api("search", { id: up.id, engine: e });
+    const r = await api("search", { id: up.id, engine: e, adult: searchAdult !== "hide" });
     results[e] = r.ok ? { state: "ok", items: r.items || [], cached: r.cached } : { state: "ng", items: [], reason: r.reason };
     renderResults();
   }));
@@ -324,7 +369,8 @@ function allItems() {
       } else map.set(key, { ...it, engines: [e], rank: idx });
     });
   }
-  const arr = [...map.values()];
+  let arr = [...map.values()];
+  if (adultView() === "hide") arr = arr.filter((x) => !isAdult(x));
   const score = (x) => (x.similarity ?? 55 - x.rank) + (x.engines.length - 1) * 8 + (x.pixiv_id ? 4 : 0);
   return arr.sort((a, b) => score(b) - score(a));
 }
@@ -351,8 +397,9 @@ function renderResults() {
     const px = best.pixiv_id && pixivInfo[best.pixiv_id];
     const title = px && !px.error ? px.title : best.title;
     const author = px && !px.error ? px.user : best.author;
-    b.innerHTML = `<img src="${esc(pxThumb((px && !px.error && px.thumb) || best.thumb || ""))}" alt="" referrerpolicy="no-referrer" onerror="this.style.visibility='hidden'">
-      <div><span class="label">いちばん有力</span>
+    const bAdult = isAdult(best);
+    b.innerHTML = `<img class="${bAdult && adultView() === "blur" ? "blurred" : ""}" src="${esc(pxThumb((px && !px.error && px.thumb) || best.thumb || ""))}" alt="" referrerpolicy="no-referrer" onerror="this.style.visibility='hidden'">
+      <div><span class="label">いちばん有力</span>${bAdult ? ' <span class="badge r18">R-18</span>' : ""}
         <h3>${esc(title)}</h3>
         <p>${esc(s.label === "そのほか" ? s.host : s.label)}${author ? " ・ " + esc(author) : ""}${best.similarity != null ? ` ・ 似ている度 ${best.similarity}%` : ""}${best.engines.length > 1 ? ` ・ ${best.engines.length}つのエンジンが一致` : ""}</p>
         ${best.note ? `<p>${esc(best.note)}</p>` : ""}
@@ -368,6 +415,7 @@ function renderResults() {
   $$("#tabs .tab").forEach((t) => t.onclick = () => { view.tab = t.dataset.tab; view.site = "all"; renderResults(); });
 
   let shown = view.tab === "all" ? items : (results[view.tab]?.items || []).map((x) => ({ ...x, engines: [view.tab] }));
+  if (view.tab !== "all" && adultView() === "hide") shown = shown.filter((x) => !isAdult(x));
   // サイトのしぼりこみ
   const siteCount = {};
   shown.forEach((x) => { const k = siteOf(x).key; siteCount[k] = (siteCount[k] || 0) + 1; });
@@ -396,11 +444,13 @@ function card(it) {
   const author = px ? px.user : it.author;
   const thumb = pxThumb(it.thumb || (px && px.thumb) || "");
   const oldest = it.engines.includes("tineye") && it.date;
+  const adult = isAdult(it), blur = adult && adultView() === "blur";
   return `<a class="card" href="${esc(it.url)}" target="_blank" rel="noopener noreferrer">
-    ${thumb ? `<img class="th" src="${esc(thumb)}" alt="" loading="lazy" referrerpolicy="no-referrer" onerror="this.outerHTML='<div class=&quot;th none&quot;>?</div>'">` : `<div class="th none">?</div>`}
+    ${thumb ? `<img class="th${blur ? " blurred" : ""}" src="${esc(thumb)}" alt="" loading="lazy" referrerpolicy="no-referrer" onerror="this.outerHTML='<div class=&quot;th none&quot;>?</div>'">` : `<div class="th none">?</div>`}
     <div class="body">
       <div class="title">${esc(title)}</div>
       <div class="meta">
+        ${adult ? `<span class="badge r18">R-18</span>` : ""}
         <span class="badge site-${s.key}">${esc(s.key === "other" ? s.host || "そのほか" : s.label)}</span>
         ${sim != null ? `<span class="sim ${simCls}"><i><b style="width:${Math.max(4, Math.min(100, sim))}%"></b></i>${sim}%</span>` : ""}
         ${author ? `<span>✎ ${esc(author)}</span>` : ""}
@@ -418,19 +468,30 @@ async function loadPixiv() {
   if (!ids.length) { renderResults(); return; }
   const r = await api("pixiv", { ids });
   if (r.ok) pixivInfo = r.items || {};
+  pixivIds = ids;
+  renderPixiv();
+  renderResults();
+}
+let pixivIds = [];
+function renderPixiv() {
   const box = $("#pixivBox");
+  const mode = adultView();
+  const all = Object.values(results).flatMap((r) => r.items || []).filter((x) => x.pixiv_id);
+  const from = (id) => all.find((x) => x.pixiv_id === id) || {};
+  const ids = pixivIds.filter((id) => mode !== "hide" || !(pixivInfo[id]?.adult || from(id).adult));
+  if (!ids.length) { box.classList.add("hide"); return; }
   $("#pixivList").innerHTML = ids.map((id) => {
     const p = pixivInfo[id] || {};
-    const fromItem = allItems().find((x) => x.pixiv_id === id) || {};
+    const fromItem = from(id);
     const ok = p && !p.error;
-    const img = ok && !p.adult ? pxThumb(p.thumb) : (fromItem.thumb || "");
+    const adult = !!(p.adult || fromItem.adult);
+    const img = ok && p.thumb ? pxThumb(p.thumb) : (fromItem.thumb || "");
     return `<a class="px-card" href="https://www.pixiv.net/artworks/${id}" target="_blank" rel="noopener noreferrer">
-      ${img ? `<img src="${esc(img)}" alt="" loading="lazy" referrerpolicy="no-referrer">` : `<div class="r18">pixiv</div>`}
-      <div class="t">${esc(ok ? p.title : fromItem.title || "作品 " + id)}</div>
+      ${img ? `<img class="${adult && mode === "blur" ? "blurred" : ""}" src="${esc(img)}" alt="" loading="lazy" referrerpolicy="no-referrer">` : `<div class="r18">pixiv</div>`}
+      <div class="t">${adult ? '<span class="badge r18">R-18</span> ' : ""}${esc(ok ? p.title : fromItem.title || "作品 " + id)}</div>
       <div class="u">${esc(ok ? p.user : fromItem.author || "")}${ok && p.date ? " ・ " + esc(p.date) : ""}</div></a>`;
   }).join("");
   box.classList.remove("hide");
-  renderResults();
 }
 
 // ---------- 履歴（この端末だけ） ----------
@@ -525,7 +586,8 @@ async function renderAdmin() {
       ${textInput("guest_daily_limit", "ゲストの1日の回数（IP ごと）", "3")}
       ${textInput("cache_days", "同じ画像の結果を使い回す日数", "7", "0 にすると毎回 API を呼びます")}
       ${textInput("min_similarity", "SauceNAO の似ている度の下限（%）", "0", "これより低い結果は出しません")}
-      <label class="switch"><input type="checkbox" id="hideAdult" ${st.hide_adult === "off" ? "" : "checked"}>成人向けの結果を隠す（SauceNAO・trace.moe）</label>
+      ${sel("adult_mode", "成人向けの結果", [["login", "ログインした人が選べる（はじめは隠す）"], ["all", "だれでも選べる（ゲストも）"], ["hide", "だれにも表示しない"]], st.hide_adult === "off" ? "all" : "login")}
+      <p class="fine" style="margin:-6px 0 0">選べるようにすると、検索画面に「隠す／ぼかす／表示する」が出ます（はじめて選ぶときに18歳以上かを確認）。成人向けの判定ができるのは SauceNAO・trace.moe・pixiv の作品だけです。</p>
       <label>お知らせ（検索画面の上に出ます）<span class="row"><textarea class="grow" rows="2" data-k="notice" placeholder="なし">${esc(st.notice || "")}</textarea><button class="btn sm" data-save="notice">保存</button></span></label>
     </div></div>
     <div class="panel"><h2>この7日間のエンジン別</h2>
@@ -552,7 +614,6 @@ async function renderAdmin() {
   });
   $$("[data-autosave]", body).forEach((s) => s.onchange = async () => { if (await save(s.dataset.k, s.value)) loadInfo(); });
   $$("[data-engine-on]", body).forEach((c) => c.onchange = async () => { if (await save("engine_" + c.dataset.engineOn, c.checked ? "on" : "off")) loadInfo(); });
-  $("#hideAdult").onchange = async (e) => { await save("hide_adult", e.target.checked ? "on" : "off"); };
   $("#clearCache").onclick = async () => { if (confirm("保存済みの結果をすべて消しますか？")) { await save("clear_cache", "1"); renderAdmin(); } };
   $$("[data-test]", body).forEach((b) => b.onclick = async () => {
     const e = b.dataset.test, out = $(`[data-out="${e}"]`, body);

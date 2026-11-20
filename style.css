@@ -238,3 +238,18 @@ input:focus, select:focus, textarea:focus { border-color: var(--ink); }
   .card .th { width: 72px; height: 72px; }
   .url-row { flex-direction: column; }
 }
+
+/* 成人向けの表示設定 */
+.adult-row { display: flex; align-items: center; justify-content: center; flex-wrap: wrap; gap: 8px 10px; margin: 14px 0 0; font-size: 13px; }
+.adult-label { font-weight: 700; color: var(--sub); }
+.seg { display: inline-flex; background: var(--paper); border: 1.5px solid var(--line); border-radius: 999px; padding: 2px; }
+.seg button { border: 0; background: none; padding: 4px 12px; border-radius: 999px; font-size: 13px; font-weight: 700; color: var(--sub); }
+.seg button.on { background: var(--ink); color: var(--paper); }
+.seg button:disabled { cursor: not-allowed; }
+.adult-row.locked .seg { opacity: .45; }
+.adult-note { color: var(--sub); width: 100%; text-align: center; }
+.adult-note:empty { display: none; }
+.badge.r18 { background: var(--ng); color: #fff; border-color: var(--ng); }
+.th, .best img, .px-card img { clip-path: inset(0 round 10px); }
+.blurred { filter: blur(14px) saturate(.6); }
+.px-card img.blurred { transform: scale(1.1); }

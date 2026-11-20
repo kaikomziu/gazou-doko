@@ -12,7 +12,7 @@
 <link rel="preconnect" href="https://fonts.googleapis.com">
 <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
 <link href="https://fonts.googleapis.com/css2?family=Zen+Kaku+Gothic+New:wght@400;500;700;900&display=swap" rel="stylesheet">
-<link rel="stylesheet" href="style.css?v=1.0.0">
+<link rel="stylesheet" href="style.css?v=1.1.0">
 <script src="https://kaikomziu.github.io/game-links/js/karuwaka-account.js" data-game="gazou-doko" data-badge="off"></script>
 </head>
 <body>
@@ -62,6 +62,16 @@
     </form>
 
     <div class="engines" id="enginePick"></div>
+
+    <div class="adult-row" id="adultRow">
+      <span class="adult-label">成人向けの結果</span>
+      <div class="seg" role="radiogroup" aria-label="成人向けの結果">
+        <button type="button" role="radio" data-adult="hide">隠す</button>
+        <button type="button" role="radio" data-adult="blur">ぼかす</button>
+        <button type="button" role="radio" data-adult="show">表示する</button>
+      </div>
+      <small class="adult-note" id="adultNote"></small>
+    </div>
 
     <div class="go-row">
       <button class="btn big" id="searchBtn" disabled>
@@ -117,11 +127,11 @@
 </main>
 
 <footer class="foot">
-  <span>画像どこかな検索 <span class="ver">v1.0.0</span></span>
+  <span>画像どこかな検索 <span class="ver">v1.1.0</span></span>
   <span>by かるわか ・ <a href="https://kaikomziu.github.io/game-links/" target="_blank" rel="noopener">かるわかGAMES</a></span>
 </footer>
 
 <div id="toast" class="toast" role="status"></div>
-<script type="module" src="app.js?v=1.0.0"></script>
+<script type="module" src="app.js?v=1.1.0"></script>
 </body>
 </html>

@@ -1,5 +1,5 @@
 // 画像どこかな検索 ― 画面の動き
-const VERSION = "1.1.0";
+const VERSION = "1.2.0";
 const SUPA = "https://kifnzvktwbomxthzvvgy.supabase.co";
 // 公開用の anon key（かるわかGAMES の SDK と同じ。公開しても問題ないキー）
 const ANON = "eyJhbGciOiJIUzI1NiIsInR5cCI6IkpXVCJ9.eyJpc3MiOiJzdXBhYmFzZSIsInJlZiI6ImtpZm56dmt0d2JvbXh0aHp2dmd5Iiwicm9sZSI6ImFub24iLCJpYXQiOjE3Nzc4MzgxMzgsImV4cCI6MjA5MzQxNDEzOH0.M7nXP-u--6J_6rRpgz1cJj21_7KX6MtfTmZy77Xf_IE";
@@ -60,19 +60,25 @@ function reasonText(r) {
 }
 
 // ---------- エンジン・サイトの見た目 ----------
-const ENGINE_LABEL = { saucenao: "SauceNAO", tracemoe: "trace.moe", serpapi: "SerpApi", searchapi: "SearchApi", tineye: "TinEye", ris: "Reverse Image Search API" };
-const ENGINE_ORDER = ["saucenao", "tracemoe", "serpapi", "searchapi", "tineye", "ris"];
+const ENGINE_LABEL = { saucenao: "SauceNAO", tracemoe: "trace.moe", animetrace: "AnimeTrace", iqdb: "IQDB", fluffle: "Fluffle", serpapi: "SerpApi", searchapi: "SearchApi", serper: "Serper", scrapingdog: "Scrapingdog", vision: "Google Vision", tineye: "TinEye", ris: "Reverse Image Search API" };
+const ENGINE_ORDER = ["saucenao", "tracemoe", "animetrace", "iqdb", "fluffle", "serpapi", "searchapi", "serper", "scrapingdog", "vision", "tineye", "ris"];
+// はじめは外しておくエンジン（Fluffle はケモノ系専用なので）
+const DEFAULT_OFF = ["fluffle"];
 const SITES = [
   { key: "pixiv", label: "pixiv", re: /(^|\.)pixiv\.net$|(^|\.)pximg\.net$|fanbox\.cc$/ },
   { key: "x", label: "X（Twitter）", re: /(^|\.)(twitter|x)\.com$|twimg\.com$|fxtwitter|vxtwitter/ },
   { key: "danbooru", label: "Danbooru など", re: /danbooru|gelbooru|yande\.re|konachan|sankaku|safebooru|zerochan|e-shuushuu|anime-pictures/ },
   { key: "anime", label: "アニメ", re: /anilist\.co|myanimelist\.net|trace\.moe|annict/ },
+  { key: "furry", label: "ケモノ系", re: /e621\.net|e926\.net|furaffinity\.net|weasyl\.com|inkbunny\.net|furrynetwork|sofurry/ },
   { key: "nico", label: "ニコニコ", re: /nicovideo\.jp|nicoseiga|seiga\.nicovideo/ },
   { key: "art", label: "DeviantArt・ArtStation", re: /deviantart|artstation|behance/ },
   { key: "sns", label: "SNS", re: /instagram|facebook|threads\.net|bsky|misskey|tumblr|reddit|pinterest|weibo|lofter/ },
   { key: "shop", label: "ショップ", re: /booth\.pm|skeb\.jp|amazon\.|rakuten|melonbooks|toranoana|dlsite|fantia/ },
 ];
 function siteOf(it) {
+  // AnimeTrace はキャラクター名の結果（リンク先は pixiv のタグ検索）
+  if (it.site === "AnimeTrace") return { key: "chara", label: "キャラ名", host: "AnimeTrace" };
+  if (it.site === "Google Vision") return { key: "hint", label: "キーワード", host: "Google Vision" };
   let h = "";
   try { h = new URL(it.url).hostname.replace(/^www\./, ""); } catch { /* 無視 */ }
   for (const s of SITES) if (s.re.test(h)) return { ...s, host: h };
@@ -114,7 +120,7 @@ function renderAdult() {
   });
   $("#adultNote").textContent = m === "hide" ? "管理者の設定で、成人向けの結果は表示しません"
     : !ok ? "ログインすると選べます（18歳以上の方のみ）"
-    : cur !== "hide" ? "R-18 の印が付くのは SauceNAO・trace.moe・pixiv の結果だけです"
+    : cur !== "hide" ? "R-18 の印が付くのは SauceNAO・trace.moe・IQDB・Fluffle・pixiv の結果だけです"
     : "Google レンズなどの結果は判定できないため、まれに成人向けが出ることがあります";
 }
 $$("#adultRow [data-adult]").forEach((b) => b.onclick = () => {
@@ -202,13 +208,13 @@ function renderEngines() {
   try { saved = JSON.parse(localStorage.getItem(pickKey) || "null"); } catch { /* 無視 */ }
   $("#enginePick").innerHTML = ENGINE_ORDER.map((e) => {
     const ok = on.has(e);
-    const checked = ok && (!saved || !saved.off?.includes(e));
+    const checked = ok && (saved ? !saved.off?.includes(e) && !(DEFAULT_OFF.includes(e) && !saved.seen?.includes(e)) : !DEFAULT_OFF.includes(e));
     return `<label class="eng ${ok ? "" : "off"}" title="${ok ? "" : "管理者がまだ設定していません"}">
       <input type="checkbox" value="${e}" ${checked ? "checked" : ""} ${ok ? "" : "disabled"}>${esc(ENGINE_LABEL[e])}${ok ? "" : "（未設定）"}</label>`;
   }).join("");
   $$("#enginePick input").forEach((i) => i.onchange = () => {
     const off = $$("#enginePick input:not(:checked):not(:disabled)").map((x) => x.value);
-    localStorage.setItem(pickKey, JSON.stringify({ off }));
+    localStorage.setItem(pickKey, JSON.stringify({ off, seen: ENGINE_ORDER }));
     updateSearchBtn();
   });
   updateSearchBtn();
@@ -419,7 +425,7 @@ function renderResults() {
   // サイトのしぼりこみ
   const siteCount = {};
   shown.forEach((x) => { const k = siteOf(x).key; siteCount[k] = (siteCount[k] || 0) + 1; });
-  const siteList = [...SITES, { key: "other", label: "そのほか" }].filter((s) => siteCount[s.key]);
+  const siteList = [...SITES, { key: "chara", label: "キャラ名" }, { key: "hint", label: "キーワード" }, { key: "other", label: "そのほか" }].filter((s) => siteCount[s.key]);
   $("#siteChips").innerHTML = siteList.length > 1
     ? [`<button class="chip ${view.site === "all" ? "on" : ""}" data-site="all">すべて</button>`, ...siteList.map((s) => `<button class="chip ${view.site === s.key ? "on" : ""}" data-site="${s.key}">${esc(s.label)} ${siteCount[s.key]}</button>`)].join("")
     : "";
@@ -534,10 +540,17 @@ $("#histClear").onclick = () => { if (confirm("履歴をすべて消しますか
 const ENGINE_ADMIN = [
   { e: "saucenao", key: "saucenao_key", link: "https://saucenao.com/user.php?page=search-api", desc: "イラスト・pixiv・Danbooru・漫画向け。無料アカウントでもキーがもらえます（1日の回数に上限あり）。" },
   { e: "tracemoe", key: "tracemoe_key", link: "https://soruly.github.io/trace.moe-api/", desc: "アニメの場面検索。キーなしでも使えます（回数が少なめ）。キーを入れると上限が増えます。", optional: true },
+  { e: "animetrace", key: "", link: "https://www.animetrace.com/", desc: "アニメ・ゲームのキャラクター名を当てます（出どころではなく「だれが写っているか」）。結果は pixiv のタグ検索につながります。キー不要。", nokey: true, mode: "animetrace_model",
+    modes: [["animetrace_high_beta", "アニメ（高精度・ベータ）"], ["pre_stable", "アニメ（安定版）"], ["full_game_model_kira", "ゲーム"]], modeDef: "animetrace_high_beta" },
+  { e: "iqdb", key: "", link: "https://iqdb.org/", desc: "Danbooru・Gelbooru・yande.re・Zerochan などのイラストを探します。キー不要。混んでいると1分以上かかることがあります。", nokey: true },
+  { e: "fluffle", key: "", link: "https://fluffle.xyz/", desc: "ケモノ系のイラスト専用（e621・Fur Affinity・Weasyl など）。キー不要。検索画面でははじめはチェックを外しています。", nokey: true },
   { e: "serpapi", key: "serpapi_key", link: "https://serpapi.com/manage-api-key", desc: "Google レンズなどを API で使えます。", mode: "serpapi_engine",
     modes: [["google_lens", "Google レンズ（似た画像）"], ["google_lens_exact", "Google レンズ（完全一致）"], ["google_reverse_image", "Google 逆画像検索"], ["yandex_images", "Yandex 画像"], ["bing_reverse_image", "Bing 逆画像（Enterprise のみ）"]] },
   { e: "searchapi", key: "searchapi_key", link: "https://www.searchapi.io/", desc: "SerpApi と同じく、Google レンズなどを使えます。", mode: "searchapi_engine",
     modes: [["google_lens", "Google レンズ（似た画像）"], ["google_lens_exact", "Google レンズ（完全一致）"], ["google_reverse_image", "Google 逆画像検索"], ["yandex_reverse_image", "Yandex 逆画像"], ["bing_reverse_image", "Bing 逆画像"]] },
+  { e: "serper", key: "serper_key", link: "https://serper.dev/api-key", desc: "Google レンズの結果。登録すると無料の回数がもらえます。" },
+  { e: "scrapingdog", key: "scrapingdog_key", link: "https://www.scrapingdog.com/", desc: "Google レンズの結果。1回の検索で10クレジット使います。" },
+  { e: "vision", key: "vision_key", link: "https://console.cloud.google.com/apis/credentials", desc: "Google Cloud Vision の Web Detection。同じ画像が載っているページと、推測される作品名・キーワードを出します。月1,000回まで無料（Google Cloud で Vision API を有効にして API キーを作る。キーは Vision API だけに制限するのがおすすめ）。" },
   { e: "tineye", key: "tineye_key", link: "https://services.tineye.com/TinEyeAPI", desc: "同じ画像が載っているページを、掲載の古い順に出します。元の投稿を探すのに便利（有料）。" },
   { e: "ris", key: "ris_key", link: "", desc: "そのほかの逆画像検索 API（RapidAPI・Zyla など）。URL のひな形と認証のしかたを決めると使えます。結果の形は自動で読み取ります。", ris: true },
 ];
@@ -563,10 +576,10 @@ async function renderAdmin() {
       <div class="kv">
         ${x.ris ? textInput("ris_label", "表示名", "Reverse Image Search API") + textInput("ris_endpoint", "URL のひな形", "https://example.com/search?url={url}", "{url} が画像の URL に置きかわります（{key} も使えます）") +
           sel("ris_auth", "キーの渡し方", [["bearer", "Authorization: Bearer キー"], ["header:X-API-Key", "ヘッダー X-API-Key"], ["header:x-rapidapi-key", "RapidAPI（x-rapidapi-key）"], ["query:api_key", "URL に ?api_key=キー"], ["query:key", "URL に ?key=キー"]], "bearer") : ""}
-        ${secretInput(x.key, x.optional ? "（なくても使えます）" : "")}
-        ${x.mode ? sel(x.mode, "検索のしかた", x.modes, "google_lens") : ""}
+        ${x.nokey ? "" : secretInput(x.key, x.optional ? "（なくても使えます）" : "")}
+        ${x.mode ? sel(x.mode, x.e === "animetrace" ? "使うモデル" : "検索のしかた", x.modes, x.modeDef || "google_lens") : ""}
       </div>
-      <div class="row"><button class="btn ghost sm" data-test="${x.e}">テストする</button><span class="fine">${x.e === "tracemoe" ? "" : "※ テストでも1回分の回数を使います"}</span></div>
+      <div class="row"><button class="btn ghost sm" data-test="${x.e}">テストする</button><span class="fine">${x.e === "tracemoe" || x.nokey ? "" : "※ テストでも1回分の回数を使います"}</span></div>
       <div class="test-out hide" data-out="${x.e}"></div>
     </div>`;
   }).join("");
@@ -587,7 +600,7 @@ async function renderAdmin() {
       ${textInput("cache_days", "同じ画像の結果を使い回す日数", "7", "0 にすると毎回 API を呼びます")}
       ${textInput("min_similarity", "SauceNAO の似ている度の下限（%）", "0", "これより低い結果は出しません")}
       ${sel("adult_mode", "成人向けの結果", [["login", "ログインした人が選べる（はじめは隠す）"], ["all", "だれでも選べる（ゲストも）"], ["hide", "だれにも表示しない"]], st.hide_adult === "off" ? "all" : "login")}
-      <p class="fine" style="margin:-6px 0 0">選べるようにすると、検索画面に「隠す／ぼかす／表示する」が出ます（はじめて選ぶときに18歳以上かを確認）。成人向けの判定ができるのは SauceNAO・trace.moe・pixiv の作品だけです。</p>
+      <p class="fine" style="margin:-6px 0 0">選べるようにすると、検索画面に「隠す／ぼかす／表示する」が出ます（はじめて選ぶときに18歳以上かを確認）。成人向けの判定ができるのは SauceNAO・trace.moe・IQDB・Fluffle・pixiv の作品だけです。</p>
       <label>お知らせ（検索画面の上に出ます）<span class="row"><textarea class="grow" rows="2" data-k="notice" placeholder="なし">${esc(st.notice || "")}</textarea><button class="btn sm" data-save="notice">保存</button></span></label>
     </div></div>
     <div class="panel"><h2>この7日間のエンジン別</h2>

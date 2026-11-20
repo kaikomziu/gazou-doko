@@ -1,10 +1,16 @@
-# 画像どこかな検索 v1.1.0
+# 画像どこかな検索 v1.2.0
 
 画像を選ぶと、いくつもの逆画像検索エンジンでまとめて出どころ（ソース）を探す Web サービス。作者：かるわか。
 
 ## 使っている検索エンジン
 - SauceNAO（イラスト・pixiv・Danbooru・漫画）
 - trace.moe（アニメの場面。キーなしでも動く）
+- AnimeTrace（キャラクター名。キー不要）
+- IQDB（Danbooru など。キー不要。HTML を読み取る）
+- Fluffle（ケモノ系。キー不要）
+- Serper.dev（Google レンズ）
+- Scrapingdog（Google レンズ）
+- Google Cloud Vision（Web Detection）
 - SerpApi（Google レンズ ほか）
 - SearchApi（Google レンズ ほか）
 - TinEye（同じ画像の掲載ページ。古い順）

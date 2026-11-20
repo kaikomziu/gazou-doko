@@ -42,16 +42,18 @@ async function stat(engine: string, kind: "call" | "cached" | "error", info?: st
 }
 
 // ---------- エンジンの一覧 ----------
-export const ENGINES = ["saucenao", "tracemoe", "serpapi", "searchapi", "tineye", "ris"] as const;
+export const ENGINES = ["saucenao", "tracemoe", "animetrace", "iqdb", "fluffle", "serpapi", "searchapi", "serper", "scrapingdog", "vision", "tineye", "ris"] as const;
 type Engine = typeof ENGINES[number];
-// キーが必要か（trace.moe はキーなしでも使える）
+// それぞれの API キーの名前（trace.moe・AnimeTrace・IQDB・Fluffle はキーなしでも使える）
 const KEY_OF: Record<Engine, string> = {
-  saucenao: "saucenao_key", tracemoe: "tracemoe_key", serpapi: "serpapi_key",
-  searchapi: "searchapi_key", tineye: "tineye_key", ris: "ris_key",
+  saucenao: "saucenao_key", tracemoe: "tracemoe_key", animetrace: "", iqdb: "", fluffle: "",
+  serpapi: "serpapi_key", searchapi: "searchapi_key", serper: "serper_key", scrapingdog: "scrapingdog_key",
+  vision: "vision_key", tineye: "tineye_key", ris: "ris_key",
 };
+const NO_KEY: Engine[] = ["tracemoe", "animetrace", "iqdb", "fluffle"];
 const enabled = (cfg: Config, e: Engine) => {
   if ((cfg.settings["engine_" + e] || "on") === "off") return false;
-  if (e === "tracemoe") return true;
+  if (NO_KEY.includes(e)) return true;
   if (e === "ris" && !cfg.settings.ris_endpoint) return false;
   return !!cfg.secrets[KEY_OF[e]];
 };
@@ -178,7 +180,7 @@ async function tracemoe(cfg: Config, imgUrl: string): Promise<Item[]> {
 }
 
 // ---- SerpApi / SearchApi / 汎用 API の結果から、リンクの一覧を取り出す ----
-const LIST_KEYS = ["exact_matches", "visual_matches", "image_results", "pages_with_matching_images", "inline_images", "image_sources", "organic_results", "similar_images", "related_content", "results", "matches", "data", "items"];
+const LIST_KEYS = ["lens_results", "organic", "visual_results", "exact_matches", "visual_matches", "image_results", "pages_with_matching_images", "inline_images", "image_sources", "organic_results", "similar_images", "related_content", "results", "matches", "data", "items"];
 function pick(o: Record<string, unknown>, ...ks: string[]) {
   for (const k of ks) {
     const v = k.split(".").reduce<unknown>((a, p) => (a && typeof a === "object" ? (a as Record<string, unknown>)[p] : undefined), o);
@@ -286,7 +288,174 @@ async function ris(cfg: Config, imgUrl: string): Promise<Item[]> {
   return dedupe(linksFrom(d)).slice(0, 40);
 }
 
-const RUN: Record<Engine, (cfg: Config, url: string) => Promise<Item[]>> = { saucenao, tracemoe, serpapi, searchapi, tineye, ris };
+// 一時置き場の画像そのもの（ファイルで送る API 用）
+async function imageBytes(imgUrl: string) {
+  const res = await fetch(imgUrl);
+  if (!res.ok) throw new Error("storage_" + res.status);
+  const buf = new Uint8Array(await res.arrayBuffer());
+  return { buf, mime: sniff(buf) || "image/jpeg" };
+}
+const stripTags = (h: unknown) => String(h ?? "").replace(/<[^>]*>/g, "").replace(/&amp;/g, "&").replace(/&quot;/g, '"').replace(/&#39;/g, "'").replace(/&lt;/g, "<").replace(/&gt;/g, ">").trim();
+
+// ---- AnimeTrace（アニメ・ゲームのキャラクターを当てる。出どころではなく「だれが写っているか」） ----
+async function animetrace(cfg: Config, imgUrl: string): Promise<Item[]> {
+  const fd = new FormData();
+  fd.set("url", imgUrl);
+  fd.set("model", cfg.settings.animetrace_model || "animetrace_high_beta");
+  fd.set("ai_detect", "1");
+  const d = await getJson("https://api.animetrace.com/v1/search", { method: "POST", body: fd, headers: { "User-Agent": UA } }, "animetrace");
+  if (Number(d.code) !== 0) throw new Error("animetrace_" + d.code);
+  const out: Item[] = [];
+  const ai = d.ai === true;
+  for (const [bi, box] of ((d.data as Record<string, unknown>[]) || []).slice(0, 6).entries()) {
+    const chars = ((box.character as Record<string, string>[]) || []).slice(0, 3);
+    chars.forEach((c, ci) => {
+      if (!c.character) return;
+      out.push(item({
+        // 出どころの URL はないので、pixiv のタグ検索へ（同じキャラの絵を探せる）
+        url: `https://www.pixiv.net/tags/${encodeURIComponent(c.character)}/artworks`,
+        title: `${c.character}${c.work ? `（${c.work}）` : ""}`, site: "AnimeTrace",
+        note: [ (d.data as unknown[]).length > 1 ? `${bi + 1}人目` : "", ci > 0 ? `候補${ci + 1}` : "",
+          box.not_confident ? "自信なし" : "", ai && bi === 0 && ci === 0 ? "AI で作られた画像の可能性あり" : "",
+          "pixiv でこのキャラの絵を探す" ].filter(Boolean).join(" ／ "),
+      }));
+    });
+  }
+  return out;
+}
+
+// ---- IQDB（Danbooru・Gelbooru・yande.re などのイラスト。キー不要。混んでいると遅い） ----
+// IQDB はときどき「結果を読めません、もう一度」と返すので、そのときは1回だけやり直す
+async function iqdb(cfg: Config, imgUrl: string): Promise<Item[]> {
+  const { buf, mime } = await imageBytes(imgUrl);
+  try { return await iqdbOnce(buf, mime); }
+  catch (e) {
+    if (!/try again/i.test(String((e as Error).message))) throw e;
+    await new Promise((r) => setTimeout(r, 1500));
+    return await iqdbOnce(buf, mime);
+  }
+}
+async function iqdbOnce(buf: Uint8Array, mime: string): Promise<Item[]> {
+  // 最初にクッキーをもらう（ないと 307 で戻される）
+  const first = await fetch("https://iqdb.org/", { headers: { "User-Agent": UA }, redirect: "manual" });
+  const cookie = (first.headers.get("set-cookie") || "").split(";")[0];
+  await first.body?.cancel();
+  const fd = new FormData();
+  fd.set("file", new Blob([buf], { type: mime }), "image." + mime.split("/")[1]);
+  const ctl = new AbortController();
+  const t = setTimeout(() => ctl.abort(), 100000);
+  let html = "";
+  try {
+    const res = await fetch("https://iqdb.org/", { method: "POST", body: fd, headers: { "User-Agent": UA, ...(cookie ? { Cookie: cookie } : {}) }, signal: ctl.signal });
+    if (!res.ok) throw new Error("iqdb_" + res.status);
+    html = await res.text();
+  } catch (e) {
+    if ((e as Error).name === "AbortError") throw new Error("iqdb_timeout");
+    throw e;
+  } finally { clearTimeout(t); }
+  if (/class='err'/.test(html) && !/class='pages'/.test(html)) throw new Error("iqdb_" + clip(stripTags(html.match(/class='err'>([\s\S]*?)<\/div>/)?.[1]), 80));
+  const pages = html.split("<div class='pages'>")[1] || "";
+  const out: Item[] = [];
+  for (const block of pages.split("<div><table>").slice(1)) {
+    if (/Your image/.test(block)) continue;
+    const sim = Number(block.match(/(\d+)% similarity/)?.[1] || 0);
+    const href = block.match(/<td class='image'><a href="([^"]+)"/)?.[1];
+    if (!href || sim < 75) continue;   // 75% 未満は別の絵のことが多い
+    const url = href.startsWith("//") ? "https:" + href : href;
+    const src = block.match(/<img src='([^']+)'/)?.[1] || "";
+    const alt = block.match(/alt="([^"]*)"/)?.[1] || "";
+    const rating = alt.match(/Rating: (\w)/)?.[1] || "";
+    const size = stripTags(block.match(/<td>(\d+\D\d+ \[[^\]]*\])<\/td>/)?.[1]).replace(/\D(?=\d+ \[)/, "×");
+    const tags = alt.replace(/^.*Tags: /, "").split(" ").slice(0, 8).join(" ");
+    out.push(item({
+      url, title: tags ? tags.replace(/_/g, " ") : host(url),
+      thumb: src ? (src.startsWith("http") ? src : "https://iqdb.org" + src) : "",
+      similarity: sim, adult: rating === "q" || rating === "e",
+      note: [size, tags ? "タグ: " + tags : ""].filter(Boolean).join(" ／ "),
+    }));
+  }
+  return out;
+}
+
+// ---- Fluffle（ケモノ系のイラスト。e621・Fur Affinity など。キー不要） ----
+async function fluffle(cfg: Config, imgUrl: string): Promise<Item[]> {
+  const { buf, mime } = await imageBytes(imgUrl);
+  if (mime === "image/gif") throw new Error("fluffle_gif");
+  const fd = new FormData();
+  fd.set("File", new Blob([buf], { type: mime }), "image." + mime.split("/")[1]);
+  fd.set("Limit", "16");
+  const d = await getJson("https://api.fluffle.xyz/exact-search-by-file", { method: "POST", body: fd, headers: { "User-Agent": "gazou-doko-search/1.2 (https://kaikomziu.github.io/gazou-doko/)" } }, "fluffle");
+  const out: Item[] = [];
+  const list = (d.results as Record<string, unknown>[]) || [];
+  // 「たぶん一致」がたくさん出るときは、単純な絵で似たものが多いだけなので出さない（3件以下なら別バージョンとして出す）
+  const probableOk = list.filter((r) => r.match === "probable").length <= 3;
+  for (const r of list) {
+    if (r.match === "unlikely" || (r.match === "probable" && !probableOk)) continue;
+    const platform = String(r.platform || "");
+    const authors = ((r.authors as Record<string, string>[]) || []).map((a) => a.name).filter(Boolean).join(", ");
+    out.push(item({
+      url: String(r.url || ""), title: `${platform}${authors ? " ・ " + authors : ""}`,
+      thumb: String((r.thumbnail as Record<string, string>)?.url || ""), author: authors || undefined,
+      similarity: r.match === "exact" ? 95 : 75,
+      note: r.match === "exact" ? "完全に一致" : "たぶん一致（別バージョンの可能性）",
+      // Twitter などは成人向けかどうかを教えてくれないので、印を付けない
+      adult: r.isSfw === false && !/twitter|^x$/i.test(platform),
+    }));
+  }
+  return out.filter((i) => isHttp(i.url));
+}
+
+// ---- Serper.dev（Google レンズ） ----
+async function serper(cfg: Config, imgUrl: string): Promise<Item[]> {
+  const d = await getJson("https://google.serper.dev/lens", {
+    method: "POST", headers: { "X-API-KEY": cfg.secrets.serper_key, "Content-Type": "application/json" },
+    body: JSON.stringify({ url: imgUrl, gl: "jp", hl: "ja" }),
+  }, "serper");
+  if (d.message && !d.organic) throw new Error("serper_" + clip(d.message, 140));
+  return dedupe(linksFrom(d)).slice(0, 40);
+}
+
+// ---- Scrapingdog（Google レンズ） ----
+async function scrapingdog(cfg: Config, imgUrl: string): Promise<Item[]> {
+  const q = new URLSearchParams({ api_key: cfg.secrets.scrapingdog_key, url: "https://lens.google.com/uploadbyurl?url=" + encodeURIComponent(imgUrl) });
+  const d = await getJson(`https://api.scrapingdog.com/google_lens?${q}`, {}, "scrapingdog");
+  if (d.error || d.message && !d.lens_results) throw new Error("scrapingdog_" + clip(d.error || d.message, 140));
+  return dedupe(linksFrom(d)).slice(0, 40);
+}
+
+// ---- Google Cloud Vision（Web Detection：同じ画像が載っているページ・推測されるキーワード） ----
+async function vision(cfg: Config, imgUrl: string): Promise<Item[]> {
+  const body = { requests: [{ image: { source: { imageUri: imgUrl } }, features: [{ type: "WEB_DETECTION", maxResults: 30 }], imageContext: { webDetectionParams: { includeGeoResults: false } } }] };
+  const d = await getJson(`https://vision.googleapis.com/v1/images:annotate?key=${encodeURIComponent(cfg.secrets.vision_key)}`, {
+    method: "POST", headers: { "Content-Type": "application/json" }, body: JSON.stringify(body),
+  }, "vision");
+  const r0 = ((d.responses as Record<string, unknown>[]) || [])[0] || {};
+  if (r0.error) throw new Error("vision_" + clip((r0.error as Record<string, unknown>).message, 140));
+  const w = (r0.webDetection || {}) as Record<string, unknown>;
+  const out: Item[] = [];
+  for (const pg of (w.pagesWithMatchingImages as Record<string, unknown>[]) || []) {
+    const full = (pg.fullMatchingImages as Record<string, string>[]) || [];
+    const part = (pg.partialMatchingImages as Record<string, string>[]) || [];
+    out.push(item({
+      url: String(pg.url || ""), title: stripTags(pg.pageTitle) || host(String(pg.url || "")),
+      thumb: (full[0] || part[0])?.url, similarity: full.length ? 95 : part.length ? 75 : null,
+      note: full.length ? "同じ画像が載っています" : part.length ? "一部が同じ画像が載っています" : "",
+    }));
+  }
+  // 推測されるキーワード（作品名・キャラ名など）は、Google 検索へのリンクとして最後に足す
+  const guess = ((w.bestGuessLabels as Record<string, string>[]) || []).map((x) => x.label).filter(Boolean);
+  const ents = ((w.webEntities as Record<string, unknown>[]) || []).filter((x) => x.description).slice(0, 6).map((x) => String(x.description));
+  const words = [...new Set([...guess, ...ents])];
+  if (words.length) out.push(item({
+    url: `https://www.google.com/search?q=${encodeURIComponent(guess[0] || ents[0])}`,
+    title: `推測：${guess[0] || ents[0]}`, site: "Google Vision", note: "関連するキーワード: " + words.slice(0, 7).join("、"),
+  }));
+  return out.filter((i) => isHttp(i.url));
+}
+
+const RUN: Record<Engine, (cfg: Config, url: string) => Promise<Item[]>> = {
+  saucenao, tracemoe, animetrace, iqdb, fluffle, serpapi, searchapi, serper, scrapingdog, vision, tineye, ris,
+};
 
 // ---------- pixiv ----------
 // 作品ページ URL → 画像 URL（公開作品だけ。R-18 などは取れない）
@@ -445,7 +614,7 @@ Deno.serve(async (req) => {
       const am = adultMode(cfg);
       const wantAdult = body.adult === true && (am === "all" || (am === "login" && !!acc));
       cfg.settings._adult = wantAdult ? "1" : "";
-      const mode = engine === "serpapi" ? cfg.settings.serpapi_engine || "" : engine === "searchapi" ? cfg.settings.searchapi_engine || "" : engine === "ris" ? cfg.settings.ris_endpoint || "" : "";
+      const mode = engine === "serpapi" ? cfg.settings.serpapi_engine || "" : engine === "searchapi" ? cfg.settings.searchapi_engine || "" : engine === "ris" ? cfg.settings.ris_endpoint || "" : engine === "animetrace" ? cfg.settings.animetrace_model || "" : "";
       const ckey = engine + (mode ? ":" + mode.slice(0, 80) : "") + (wantAdult ? ":a" : "");
       const days = Number(cfg.settings.cache_days ?? 7);
       if (days > 0) {
@@ -482,7 +651,7 @@ Deno.serve(async (req) => {
     if (action === "admin_test") {
       const engine = String(body.engine) as Engine;
       if (!ENGINES.includes(engine)) return json({ ok: false, reason: "engine" });
-      if (engine !== "tracemoe" && engine !== "ris" && !cfg.secrets[KEY_OF[engine]]) return json({ ok: false, reason: "no_key" });
+      if (!NO_KEY.includes(engine) && engine !== "ris" && !cfg.secrets[KEY_OF[engine]]) return json({ ok: false, reason: "no_key" });
       const t0 = Date.now();
       try {
         const items = await RUN[engine](cfg, await testImageUrl());

@@ -1,5 +1,5 @@
 // 画像どこかな検索 ― 画面の動き
-const VERSION = "1.2.0";
+const VERSION = "1.3.0";
 const SUPA = "https://kifnzvktwbomxthzvvgy.supabase.co";
 // 公開用の anon key（かるわかGAMES の SDK と同じ。公開しても問題ないキー）
 const ANON = "eyJhbGciOiJIUzI1NiIsInR5cCI6IkpXVCJ9.eyJpc3MiOiJzdXBhYmFzZSIsInJlZiI6ImtpZm56dmt0d2JvbXh0aHp2dmd5Iiwicm9sZSI6ImFub24iLCJpYXQiOjE3Nzc4MzgxMzgsImV4cCI6MjA5MzQxNDEzOH0.M7nXP-u--6J_6rRpgz1cJj21_7KX6MtfTmZy77Xf_IE";
@@ -220,7 +220,7 @@ function renderEngines() {
   updateSearchBtn();
 }
 function updateSearchBtn() {
-  $("#searchBtn").disabled = running || !picked || !chosenEngines().length;
+  $("#searchBtn").disabled = running || !picked || !!crop || !chosenEngines().length;
 }
 
 // ---------- 画像を選ぶ ----------
@@ -253,15 +253,21 @@ $("#urlForm").onsubmit = (e) => {
 $("#clearBtn").onclick = (e) => { e.stopPropagation(); clearPick(); };
 
 function clearPick() {
+  resetCrop();
   picked = null;
   $("#dropEmpty").classList.remove("hide");
   $("#dropPreview").classList.add("hide");
   drop.classList.remove("has");
+  updateCropButtons();
   updateSearchBtn();
 }
 function showPreview(src, info) {
+  // 切り取りのときに元の画像を使えるよう、表示した画像と説明を覚えておく
+  if (picked) { picked.previewSrc = src; picked.info = info; }
+  $("#previewImg").onerror = null;
   $("#previewImg").src = src;
   $("#previewInfo").textContent = info;
+  updateCropButtons();
   $("#dropEmpty").classList.add("hide");
   $("#dropPreview").classList.remove("hide");
   drop.classList.add("has");
@@ -277,6 +283,7 @@ function loadImg(src) {
 }
 async function useFile(f) {
   if (!f.type.startsWith("image/")) return toast("画像ファイルを選んでください");
+  resetCrop();
   if (f.size > 40 * 1024 * 1024) return toast("画像が大きすぎます（40MB まで）");
   let dataUrl = await readAsDataUrl(f);
   let img;
@@ -296,6 +303,7 @@ async function useFile(f) {
   showPreview(dataUrl, `${f.name || "貼り付けた画像"} ・ ${img.width}×${img.height} ・ ${(f.size / 1024 / 1024).toFixed(1)}MB`);
 }
 async function useUrl(u) {
+  resetCrop();
   picked = { kind: "url", url: u };
   $("#urlInput").value = u;
   const pid = /pixiv\.net/.test(u) && !/pximg/.test(u) ? (u.match(/artworks\/(\d+)/) || u.match(/illust_id=(\d+)/) || [])[1] : null;
@@ -310,8 +318,136 @@ async function useUrl(u) {
     return;
   }
   showPreview(/pximg\.net/.test(u) ? pxThumb(u) : u, "URL から読み込みます");
-  $("#previewImg").onerror = () => { $("#previewImg").onerror = null; $("#previewImg").src = "icon.svg"; $("#previewInfo").textContent = "プレビューは出せませんが、そのまま検索できます"; };
+  $("#previewImg").onerror = () => {
+    $("#previewImg").onerror = null; $("#previewImg").src = "icon.svg";
+    if (picked?.url === u) { picked.previewSrc = "icon.svg"; updateCropButtons(); }
+    $("#previewInfo").textContent = "プレビューは出せませんが、そのまま検索できます";
+  };
 }
+
+// ---------- 画像の一部を切り取る ----------
+// 範囲は画像の大きさを 1 とした割合（0〜1）で持つ。切り取りはいつも元の画像から行う
+let crop = null;       // 切り取り中：{ img, rect: { x, y, w, h } }
+let lastRect = null;   // 前に選んだ範囲（もう一度切り取るときに使う）
+let cropDrag = null;
+const cropWrap = $("#cropWrap"), cropBox = $("#cropBox");
+const clamp = (v, a, b) => Math.min(b, Math.max(a, v));
+
+function updateCropButtons() {
+  const src = (picked?.original || picked)?.previewSrc;
+  const can = !!picked && !!src && !/icon\.svg$/.test(src);
+  $("#cropBtn").classList.toggle("hide", !can || !!crop);
+  $("#uncropBtn").classList.toggle("hide", !picked?.original || !!crop);
+  $("#clearBtn").classList.toggle("hide", !!crop);
+  $("#cropBar").classList.toggle("hide", !crop);
+}
+function resetCrop() {
+  if (crop) endCrop();
+  lastRect = null;
+}
+function endCrop() {
+  crop = null; cropDrag = null;
+  cropWrap.classList.remove("cropping");
+  cropBox.classList.add("hide");
+  updateCropButtons(); updateSearchBtn();
+}
+function drawCrop() {
+  const r = crop.rect;
+  Object.assign(cropBox.style, { left: r.x * 100 + "%", top: r.y * 100 + "%", width: r.w * 100 + "%", height: r.h * 100 + "%" });
+  $("#cropSize").textContent = `${Math.round(r.w * crop.img.naturalWidth)}×${Math.round(r.h * crop.img.naturalHeight)}`;
+}
+$("#cropBtn").onclick = async (e) => {
+  e.stopPropagation();
+  const base = picked?.original || picked;
+  if (!base?.previewSrc) return;
+  // ほかのサイトの画像は、許可されていないと切り取れない（pixiv はこちらの中継を通すので切り取れる）
+  const img = new Image();
+  img.crossOrigin = "anonymous";
+  try {
+    await new Promise((ok, ng) => { img.onload = ok; img.onerror = ng; img.src = base.previewSrc; });
+    const c = document.createElement("canvas"); c.width = c.height = 1;
+    const g = c.getContext("2d"); g.drawImage(img, 0, 0, 1, 1); g.getImageData(0, 0, 1, 1);
+  } catch { return toast("この URL の画像は切り取れません。画像を保存してから選ぶと切り取れます", 4500); }
+  crop = { img, rect: { ...(lastRect || { x: 0.1, y: 0.1, w: 0.8, h: 0.8 }) } };
+  $("#previewImg").src = base.previewSrc;
+  $("#previewInfo").textContent = `${base.info || "元の画像"} から切り取り中`;
+  cropWrap.classList.add("cropping");
+  cropBox.classList.remove("hide");
+  drawCrop(); updateCropButtons(); updateSearchBtn();
+};
+function cropPoint(e) {
+  const b = $("#previewImg").getBoundingClientRect();
+  return { x: clamp((e.clientX - b.left) / b.width, 0, 1), y: clamp((e.clientY - b.top) / b.height, 0, 1) };
+}
+const normRect = (x1, y1, x2, y2) => ({ x: Math.min(x1, x2), y: Math.min(y1, y2), w: Math.abs(x2 - x1), h: Math.abs(y2 - y1) });
+cropWrap.addEventListener("pointerdown", (e) => {
+  if (!crop) return;
+  e.preventDefault(); e.stopPropagation();
+  const pt = cropPoint(e), h = e.target.dataset?.h;
+  const r0 = { ...crop.rect };
+  if (h) cropDrag = { mode: h, pt, r0 };
+  else if (e.target.closest("#cropBox")) cropDrag = { mode: "move", pt, r0 };
+  else { cropDrag = { mode: "new", pt, r0 }; crop.rect = { x: pt.x, y: pt.y, w: 0, h: 0 }; drawCrop(); }
+  cropWrap.setPointerCapture(e.pointerId);
+});
+cropWrap.addEventListener("pointermove", (e) => {
+  if (!crop || !cropDrag) return;
+  const p = cropPoint(e), { mode, pt, r0 } = cropDrag;
+  if (mode === "new") crop.rect = normRect(pt.x, pt.y, p.x, p.y);
+  else if (mode === "move") crop.rect = { ...r0, x: clamp(r0.x + p.x - pt.x, 0, 1 - r0.w), y: clamp(r0.y + p.y - pt.y, 0, 1 - r0.h) };
+  else {
+    let x1 = r0.x, y1 = r0.y, x2 = r0.x + r0.w, y2 = r0.y + r0.h;
+    if (mode.includes("w")) x1 = p.x;
+    if (mode.includes("e")) x2 = p.x;
+    if (mode.includes("n")) y1 = p.y;
+    if (mode.includes("s")) y2 = p.y;
+    crop.rect = normRect(x1, y1, x2, y2);
+  }
+  drawCrop();
+});
+function endCropDrag() {
+  if (!crop || !cropDrag) return;
+  // 小さすぎる範囲（ただのクリックなど）は、元の範囲に戻す
+  if (crop.rect.w < 0.02 || crop.rect.h < 0.02) { crop.rect = cropDrag.r0; drawCrop(); }
+  cropDrag = null;
+}
+cropWrap.addEventListener("pointerup", endCropDrag);
+cropWrap.addEventListener("pointercancel", endCropDrag);
+cropWrap.addEventListener("click", (e) => { if (crop) e.stopPropagation(); });
+
+function applyCrop() {
+  const { img, rect } = crop;
+  const sx = Math.round(rect.x * img.naturalWidth), sy = Math.round(rect.y * img.naturalHeight);
+  const sw = Math.round(rect.w * img.naturalWidth), sh = Math.round(rect.h * img.naturalHeight);
+  if (sw < 24 || sh < 24) return toast("範囲が小さすぎます。もう少し大きく選んでください");
+  const c = document.createElement("canvas");
+  c.width = sw; c.height = sh;
+  const g = c.getContext("2d");
+  g.fillStyle = "#fff"; g.fillRect(0, 0, sw, sh);
+  g.drawImage(img, sx, sy, sw, sh, 0, 0, sw, sh);
+  let dataUrl;
+  try { dataUrl = c.toDataURL("image/jpeg", 0.92); } catch { return toast("この画像は切り取れませんでした"); }
+  const base = picked.original || picked;
+  lastRect = { ...rect };
+  endCrop();
+  picked = { kind: "file", dataUrl, w: sw, h: sh, name: base.name || "切り取った画像", original: base, pixivSelf: base.pixivSelf };
+  showPreview(dataUrl, `切り取った画像 ・ ${sw}×${sh}`);
+  toast("切り取りました。「出どころを探す」で検索できます");
+}
+$("#cropOk").onclick = (e) => { e.stopPropagation(); applyCrop(); };
+$("#cropCancel").onclick = (e) => { e.stopPropagation(); endCrop(); $("#previewImg").src = picked.previewSrc; $("#previewInfo").textContent = picked.info || ""; };
+$("#uncropBtn").onclick = (e) => {
+  e.stopPropagation();
+  const base = picked?.original;
+  if (!base) return;
+  picked = base;
+  showPreview(base.previewSrc, base.info);
+};
+document.addEventListener("keydown", (e) => {
+  if (!crop || e.target.closest?.("input, textarea")) return;
+  if (e.key === "Escape") { e.preventDefault(); $("#cropCancel").click(); }
+  else if (e.key === "Enter") { e.preventDefault(); applyCrop(); }
+});
 
 // ---------- 検索 ----------
 $("#searchBtn").onclick = search;

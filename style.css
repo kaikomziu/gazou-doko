@@ -253,3 +253,23 @@ input:focus, select:focus, textarea:focus { border-color: var(--ink); }
 .th, .best img, .px-card img { clip-path: inset(0 round 10px); }
 .blurred { filter: blur(14px) saturate(.6); }
 .px-card img.blurred { transform: scale(1.1); }
+
+/* 画像の一部を切り取る */
+.crop-wrap { position: relative; display: inline-block; max-width: 100%; line-height: 0; border-radius: 12px; overflow: hidden; }
+.crop-wrap img { display: block; }
+.crop-wrap.cropping { touch-action: none; cursor: crosshair; user-select: none; -webkit-user-select: none; }
+.crop-wrap.cropping img { box-shadow: none; }
+.crop-box { position: absolute; border: 2px solid #fff; outline: 1px dashed rgba(0, 0, 0, .55); box-shadow: 0 0 0 9999px rgba(15, 20, 35, .55); cursor: move; }
+.crop-box .h { position: absolute; width: 16px; height: 16px; background: #fff; border: 2px solid var(--accent); border-radius: 4px; transform: translate(-50%, -50%); }
+.crop-box .nw { left: 0; top: 0; cursor: nwse-resize; }
+.crop-box .n { left: 50%; top: 0; cursor: ns-resize; }
+.crop-box .ne { left: 100%; top: 0; cursor: nesw-resize; }
+.crop-box .w { left: 0; top: 50%; cursor: ew-resize; }
+.crop-box .e { left: 100%; top: 50%; cursor: ew-resize; }
+.crop-box .sw { left: 0; top: 100%; cursor: nesw-resize; }
+.crop-box .s { left: 50%; top: 100%; cursor: ns-resize; }
+.crop-box .se { left: 100%; top: 100%; cursor: nwse-resize; }
+.crop-size { position: absolute; left: 6px; top: 6px; font-size: 11px; line-height: 1.5; background: rgba(0, 0, 0, .65); color: #fff; padding: 0 6px; border-radius: 4px; pointer-events: none; white-space: nowrap; }
+.crop-bar { display: flex; flex-direction: column; align-items: center; gap: 8px; }
+.crop-hint { color: var(--sub); font-size: 13px; }
+@media (pointer: coarse) { .crop-box .h { width: 24px; height: 24px; } }

@@ -1,5 +1,5 @@
 // 画像どこかな検索 ― 画面の動き
-const VERSION = "1.4.0";
+const VERSION = "1.5.0";
 const SUPA = "https://kifnzvktwbomxthzvvgy.supabase.co";
 // 公開用の anon key（かるわかGAMES の SDK と同じ。公開しても問題ないキー）
 const ANON = "eyJhbGciOiJIUzI1NiIsInR5cCI6IkpXVCJ9.eyJpc3MiOiJzdXBhYmFzZSIsInJlZiI6ImtpZm56dmt0d2JvbXh0aHp2dmd5Iiwicm9sZSI6ImFub24iLCJpYXQiOjE3Nzc4MzgxMzgsImV4cCI6MjA5MzQxNDEzOH0.M7nXP-u--6J_6rRpgz1cJj21_7KX6MtfTmZy77Xf_IE";
@@ -42,6 +42,8 @@ async function rpc(fn, args = {}) {
 function reasonText(r) {
   const map = {
     banned: "このアカウント・端末・ネットワークからの検索は止められています",
+    proxy: "VPN・プロキシ・サーバーからの検索は止められています。オフにしてからもう一度どうぞ",
+    tor: "Tor からの検索は止められています",
     too_fast: "続けて検索しすぎです。1分ほど待ってからもう一度どうぞ",
     multi_account: "同じ端末やネットワークで、たくさんのアカウントが使われています。いつものアカウントで検索してください",
     origin: "このページ以外からは検索できません",
@@ -550,6 +552,7 @@ async function search() {
   const payload = picked.kind === "file" ? { image: picked.dataUrl } : { url: picked.url };
   payload.device = deviceId();
   payload.fp = await fingerprint();
+  try { payload.tz = Intl.DateTimeFormat().resolvedOptions().timeZone || ""; } catch { /* 無視 */ }
   let up;
   // CAPTCHA が要るとわかっているときは先に、サーバーに求められたときはその場で1回だけ
   let ci = INFO?.captcha?.need ? INFO.captcha : null;
@@ -851,6 +854,16 @@ async function renderAdmin() {
         ${textInput("device_daily_limit", "1つの端末の1日の合計", "40", "0 で無制限")}
         ${textInput("multi_account_limit", "同じ端末で使えるアカウントの数（24時間）", "3", "これを超えた別のアカウントは検索できません。同じ IP では2倍まで")}
         ${textInput("new_account_limit", "できたばかり（24時間以内）のアカウントの1日の回数", "5")}
+        <h3 style="margin:8px 0 0">プロキシ・VPN・Tor</h3>
+        <p class="fine" style="margin:0">IP を proxycheck.io（だめなら ip-api.com）で調べ、Tor の出口の一覧（torproject.org・1日1回更新）と照らし合わせます。結果は24時間使い回します。</p>
+        ${sel("proxy_action", "VPN・プロキシのとき", [["block", "止める"], ["captcha", "CAPTCHA を出す"], ["log", "記録だけ"], ["off", "何もしない"]], "captcha")}
+        ${sel("hosting_action", "データセンター（サーバー・クラウド）のとき", [["block", "止める"], ["captcha", "CAPTCHA を出す"], ["log", "記録だけ"], ["off", "何もしない"]], "captcha")}
+        ${sel("tor_action", "Tor のとき", [["block", "止める"], ["captcha", "CAPTCHA を出す"], ["log", "記録だけ"], ["off", "何もしない"]], "block")}
+        ${sel("tz_check", "ブラウザの時間帯と IP の場所の時間帯がずれているとき", [["captcha", "CAPTCHA を出す"], ["block", "止める"], ["log", "記録だけ"], ["off", "何もしない"]], "captcha")}
+        ${sel("proxy_allow_login", "ログインしている人", [["off", "同じように扱う"], ["on", "止めずに CAPTCHA だけにする"]], "off")}
+        ${textInput("proxy_risk_min", "proxycheck の危険度がこれ以上ならプロキシ扱い（0〜100、0 で使わない）", "0")}
+        ${secretInput("proxycheck_key", "（なくても1日100回まで使えます）").replace("API キー", "proxycheck.io の API キー")}
+        <p class="fine" style="margin:-6px 0 0">無料アカウントのキーで1日1,000回になります：<a href="https://proxycheck.io/dashboard/" target="_blank" rel="noopener">proxycheck.io</a>。CAPTCHA を「使わない」にしているときは、「CAPTCHA を出す」は「止める」になります。</p>
         ${textInput("allowed_origins", "検索を受け付けるページ（カンマ区切り）", "https://kaikomziu.github.io,http://localhost:8820", "ほかのサイトから API を勝手に使われるのを防ぎます")}
       </div></div>
     <div class="panel"><h2>あやしい動き・ブロック</h2><div id="secBody"><p class="fine">読み込み中…</p></div></div>
@@ -896,10 +909,18 @@ async function renderAdmin() {
 const KIND_LABEL = { account: "アカウント", ip: "IP", net: "ネットワーク", device: "端末", fp: "ブラウザの特徴" };
 const RESULT_LABEL = { ok: "検索", blocked: "止めた" };
 const REASON_LABEL = {
-  too_fast: "連続アクセス", multi_account: "複数アカウント", ip_limit: "IP の回数切れ", device_limit: "端末の回数切れ", limit: "回数切れ",
+  too_fast: "連続アクセス", proxy: "プロキシ・VPN・Tor", captcha: "CAPTCHA を求めた", multi_account: "複数アカウント", ip_limit: "IP の回数切れ", device_limit: "端末の回数切れ", limit: "回数切れ",
   "ban:account": "ブロック中（アカウント）", "ban:ip": "ブロック中（IP）", "ban:net": "ブロック中（ネットワーク）", "ban:device": "ブロック中（端末）", "ban:fp": "ブロック中（ブラウザ）",
 };
 const short = (v) => (v ? String(v).slice(0, 8) : "—");
+// 記録の印（プロキシなど）を短い日本語に
+function flagLabel(f) {
+  if (!f) return "";
+  return f.split(" ").filter((x) => !x.startsWith("cc:")).map((x) => {
+    const t = x === "tor" ? "Tor" : x.startsWith("proxy") ? "VPN・プロキシ" + (x.includes(":") ? "（" + x.split(":")[1] + "）" : "") : x === "hosting" ? "サーバー" : x.startsWith("tz:") ? "時間帯ずれ" : x;
+    return `<span class="badge r18" title="${esc(x)}">${esc(t)}</span>`;
+  }).join(" ");
+}
 const reasonLabel = (r) => !r ? "" : REASON_LABEL[r] || (r.startsWith("captcha_fail") ? "CAPTCHA 失敗" : r.startsWith("origin") ? "ほかのサイトから" : r);
 async function renderSecurity() {
   const box = $("#secBody");
@@ -921,12 +942,12 @@ async function renderSecurity() {
     </div>
     <h3 style="margin:14px 0 6px">あやしい IP（24時間）</h3>
     <p class="fine" style="margin-top:0">止められた回数がある・複数のアカウントが使われている・10回以上検索した IP。</p>
-    ${r.suspects.length ? `<table class="stats"><tr><th>IP</th><th>検索</th><th>止めた</th><th>アカウント</th><th>端末</th><th>使った人</th><th></th></tr>${r.suspects.map((x) => `<tr>
-      <td title="${esc(x.ip)}">${short(x.ip)}</td><td class="n">${x.total}</td><td class="n">${x.blocked}</td><td class="n">${x.accounts}</td><td class="n">${x.devices}</td>
+    ${r.suspects.length ? `<table class="stats"><tr><th>IP</th><th>印</th><th>検索</th><th>止めた</th><th>アカウント</th><th>端末</th><th>使った人</th><th></th></tr>${r.suspects.map((x) => `<tr>
+      <td title="${esc(x.ip)}">${short(x.ip)}</td><td>${flagLabel(x.flags)}</td><td class="n">${x.total}</td><td class="n">${x.blocked}</td><td class="n">${x.accounts}</td><td class="n">${x.devices}</td>
       <td>${esc(x.usernames || "ゲスト")}</td><td>${banBtns("ip", x.ip, "IP を止める")} ${banBtns("net", x.net, "ネットワークごと")}</td></tr>`).join("")}</table>` : `<p class="fine">ありません。</p>`}
     <h3 style="margin:14px 0 6px">最近の記録</h3>
-    <div style="overflow-x:auto"><table class="stats"><tr><th>時刻</th><th>結果</th><th>理由</th><th>アカウント</th><th>IP</th><th>端末</th><th></th></tr>${r.recent.map((x) => `<tr>
-      <td>${new Date(x.at).toLocaleString("ja-JP")}</td><td>${x.result === "ok" ? "検索" : '<span class="unset">止めた</span>'}</td><td>${esc(reasonLabel(x.reason))}</td>
+    <div style="overflow-x:auto"><table class="stats"><tr><th>時刻</th><th>結果</th><th>理由</th><th>印</th><th>アカウント</th><th>IP</th><th>端末</th><th></th></tr>${r.recent.map((x) => `<tr>
+      <td>${new Date(x.at).toLocaleString("ja-JP")}</td><td>${x.result === "ok" ? "検索" : x.result === "challenge" ? "CAPTCHA" : '<span class="unset">止めた</span>'}</td><td>${esc(reasonLabel(x.reason))}</td><td>${flagLabel(x.flags)}</td>
       <td>${esc(x.username || "ゲスト")}</td><td title="${esc(x.ip)}">${short(x.ip)}</td><td title="${esc(x.device || "")}">${short(x.device)}</td>
       <td>${x.account ? banBtns("account", x.account, "人") : ""}${banBtns("ip", x.ip, "IP")}${banBtns("device", x.device, "端末")}</td></tr>`).join("")}</table></div>`;
   const ban = async (kind, value, hours, reason) => {

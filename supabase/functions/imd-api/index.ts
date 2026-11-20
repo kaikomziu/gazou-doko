@@ -50,6 +50,77 @@ async function ident(req: Request, body: Record<string, unknown>): Promise<Ident
   const fp = typeof body.fp === "string" && /^[0-9a-f]{16,64}$/.test(body.fp) ? body.fp.slice(0, 32) : "";
   return { ip: await hashText(ip), net: "n" + (await hashText("net|" + net)), device, fp };
 }
+// ---- プロキシ・VPN・Tor・データセンター（サーバー）からのアクセスを見分ける ----
+// proxycheck.io（キーなしで1日100回、無料キーで1000回）→ だめなら ip-api.com。結果は IP のハッシュごとに24時間使い回す
+// Tor の出口の一覧は torproject.org から1日1回取り直す
+type IpInfo = { proxy: boolean; hosting: boolean; tor: boolean; type: string; country: string; tz: string; risk: number; src: string };
+async function lookupIp(cfg: Config, ip: string): Promise<IpInfo | null> {
+  const withTimeout = (u: string) => fetch(u, { signal: AbortSignal.timeout(4000) });
+  try {
+    const q = new URLSearchParams({ vpn: "1", asn: "1", risk: "1" });
+    if (cfg.secrets.proxycheck_key) q.set("key", cfg.secrets.proxycheck_key);
+    const d = await (await withTimeout(`https://proxycheck.io/v2/${encodeURIComponent(ip)}?${q}`)).json();
+    const r = d?.[ip];
+    if ((d?.status === "ok" || d?.status === "warning") && r) {
+      const risk = Number(r.risk) || 0, type = String(r.type || "");
+      const min = Number(cfg.settings.proxy_risk_min || 0);
+      return {
+        proxy: r.proxy === "yes" || (min > 0 && risk >= min), hosting: /^hosting$/i.test(type), tor: /tor/i.test(type),
+        type, country: String(r.isocode || ""), tz: String(r.timezone || ""), risk, src: "proxycheck",
+      };
+    }
+  } catch (_e) { /* 次へ */ }
+  try {
+    const d = await (await withTimeout(`http://ip-api.com/json/${encodeURIComponent(ip)}?fields=status,countryCode,timezone,proxy,hosting`)).json();
+    if (d?.status === "success") {
+      return { proxy: !!d.proxy, hosting: !!d.hosting, tor: false, type: d.proxy ? "Proxy" : d.hosting ? "Hosting" : "", country: String(d.countryCode || ""), tz: String(d.timezone || ""), risk: 0, src: "ip-api" };
+    }
+  } catch (_e) { /* 判定できない */ }
+  return null;
+}
+async function refreshTor() {
+  try {
+    const txt = await (await fetch("https://check.torproject.org/torbulkexitlist", { signal: AbortSignal.timeout(15000) })).text();
+    const ips = txt.split(/\s+/).filter((x) => /^[0-9a-f.:]{7,45}$/i.test(x));
+    if (ips.length < 100) return;
+    const hashes = await Promise.all(ips.map((x) => hashText(x)));
+    const { error } = await sb.rpc("imd_internal_tor_set", { p_ips: hashes });
+    if (error) console.error("tor_set", error.message);
+  } catch (e) { console.error("tor_refresh", String((e as Error).message)); }
+}
+function bg(pr: Promise<unknown>) {
+  // 返事を待たせずに裏で続ける
+  // deno-lint-ignore no-explicit-any
+  const er = (globalThis as any).EdgeRuntime;
+  if (er?.waitUntil) er.waitUntil(pr); else pr.catch(() => {});
+}
+async function ipCheck(cfg: Config, req: Request, ipHashed: string): Promise<IpInfo | null> {
+  const raw = clientIp(req);
+  if (raw === "unknown") return null;
+  const { data } = await sb.rpc("imd_internal_ipinfo_get", { p_ip: ipHashed });
+  const g = (data || {}) as { info: IpInfo | null; tor: boolean; tor_at: string | null };
+  // Tor の一覧が古い（1日以上）ときは取り直す。初めてのときは待つ（最大6秒）、それ以外は裏で
+  if (!g.tor_at) await Promise.race([refreshTor(), new Promise((r) => setTimeout(r, 6000))]);
+  else if (Date.now() - Date.parse(g.tor_at) > 86400e3) bg(refreshTor());
+  let info = g.info;
+  if (!info) {
+    info = await lookupIp(cfg, raw);
+    if (info) await sb.rpc("imd_internal_ipinfo_put", { p_ip: ipHashed, p_info: info });
+  }
+  if (!info) return g.tor ? { proxy: false, hosting: false, tor: true, type: "TOR", country: "", tz: "", risk: 100, src: "tor-list" } : null;
+  return { ...info, tor: info.tor || !!g.tor };
+}
+// 時間帯（UTC との差・分）。ブラウザの時間帯と IP の場所の時間帯がずれていれば VPN などの可能性
+function tzOffset(tz: string): number | null {
+  try {
+    const part = new Intl.DateTimeFormat("en-US", { timeZone: tz, timeZoneName: "longOffset" }).formatToParts(new Date()).find((x) => x.type === "timeZoneName")?.value || "";
+    const m = part.match(/GMT([+-])(\d{2}):?(\d{2})?/);
+    if (!m) return part === "GMT" ? 0 : null;
+    return (m[1] === "-" ? -1 : 1) * (Number(m[2]) * 60 + Number(m[3] || 0));
+  } catch { return null; }
+}
+const ACTION_RANK: Record<string, number> = { off: 0, log: 1, captcha: 2, block: 3 };
+
 const DEFAULT_ORIGINS = "https://kaikomziu.github.io,http://localhost:8820";
 function originOk(cfg: Config, req: Request) {
   const o = req.headers.get("origin") || "";
@@ -647,8 +718,33 @@ Deno.serve(async (req) => {
         captchaOk = true;
       }
       const ci = captchaInfo(cfg);
+      // ---- プロキシ・VPN・Tor・データセンター・時間帯のずれ ----
+      const flags: string[] = [];
+      let action = "off";
+      if (!acc?.is_admin) {
+        const pi = await ipCheck(cfg, req, id.ip);
+        const act = (name: string, def: string) => { const a = cfg.settings[name] || def; if ((ACTION_RANK[a] ?? 0) > (ACTION_RANK[action] ?? 0)) action = a; };
+        if (pi?.tor) { flags.push("tor"); act("tor_action", "block"); }
+        if (pi?.proxy && !pi.tor) { flags.push("proxy" + (pi.type ? ":" + pi.type : "")); act("proxy_action", "captcha"); }
+        if (pi?.hosting && !pi.proxy && !pi.tor) { flags.push("hosting"); act("hosting_action", "captcha"); }
+        const btz = typeof body.tz === "string" && /^[A-Za-z_]+(\/[A-Za-z0-9_+\-]+){0,2}$/.test(body.tz) ? body.tz : "";
+        if (cfg.settings.tz_check !== "off" && pi?.tz && btz) {
+          const a = tzOffset(btz), b = tzOffset(pi.tz);
+          if (a !== null && b !== null && Math.abs(a - b) >= 60) { flags.push(`tz:${btz}≠${pi.tz}`); act("tz_check", "captcha"); }
+        }
+        if (pi?.country) flags.push("cc:" + pi.country);
+        // ログインしている人は、止めずに CAPTCHA だけにする設定
+        if (action === "block" && acc && cfg.settings.proxy_allow_login === "on") action = "captcha";
+        // CAPTCHA を使っていないときは、CAPTCHA の代わりに止める
+        if (action === "captcha" && ci.mode === "off") action = "block";
+        if (action === "block") {
+          await sb.rpc("imd_internal_log", { p: { ...logBase, flags: flags.join(" "), reason: "proxy" } });
+          return json({ ok: false, reason: flags.includes("tor") ? "tor" : "proxy" });
+        }
+      }
       const { data: gate, error: gerr } = await sb.rpc("imd_internal_gate", { p: {
         ...logBase, is_admin: !!acc?.is_admin, is_new: isNew, who, limit,
+        flags: flags.filter((f) => !f.startsWith("cc:")).length ? flags.join(" ") : "", force_captcha: action === "captcha",
         burst: Number(cfg.settings.burst_per_min || 4), ip_daily: Number(cfg.settings.ip_daily_limit ?? 60),
         device_daily: Number(cfg.settings.device_daily_limit ?? 40), multi: Number(cfg.settings.multi_account_limit || 3),
         captcha_mode: ci.mode, captcha_ok: captchaOk,
